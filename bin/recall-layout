@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Rebuild one workspace's tiled geometry from saved rectangles.
+#
+# Usage: recall-layout <workspace-id> <rects.json>
+#   rects.json: [{ "id": "0x<address>", "x":, "y":, "w":, "h": }, ...]
+set -Eeuo pipefail
+BIN="$(dirname "$(readlink -f "$0")")"
+source "$BIN/recall-lib"
+
+WS="${1:?usage: recall-layout <workspace-id> <rects.json>}"
+RECTS_FILE="${2:?usage: recall-layout <workspace-id> <rects.json>}"
+[[ -f "$RECTS_FILE" ]] || die "rects file not found: $RECTS_FILE"
+
+dispatch() { hyprctl dispatch "$1" >/dev/null 2>&1 || true; }
+addr_exists() { hyprctl -j clients | jq -e --arg a "$1" 'any(.[]; .address == $a)' >/dev/null 2>&1; }
+
+# Only arrange windows that actually came back; a snapshot always outruns
+# reality when an app failed to start.
+RECTS="$(jq -c '[ .[] ]' "$RECTS_FILE")"
+LIVE_ADDRS="$(hyprctl -j clients | jq -c '[ .[].address ]')"
+RECTS="$(jq -c --argjson live "$LIVE_ADDRS" '[ .[] | select(.id as $i | $live | index($i) != null) ]' <<<"$RECTS")"
+COUNT="$(jq 'length' <<<"$RECTS")"
+(( COUNT > 0 )) || exit 0
+
+PLAN="$(jq -f "$BIN/recall-layout.jq" <<<"$RECTS")"
+ROOT="$(jq -r '.root' <<<"$PLAN")"
+COMPLETE="$(jq -r '.complete' <<<"$PLAN")"
+
+if (( COUNT > 1 )) && [[ "$COMPLETE" != "true" ]]; then
+  # The saved rectangles are not a clean binary partition -- a leftover from a
+  # layout Hyprland itself would not produce, or a window that never came back.
+  # Sizing alone is still worth doing; the tree rebuild is not.
+  echo "recall-layout: ws$WS geometry is not a clean split tree; sizing only" >&2
+fi
+
+# Preselect and focus both act on the visible workspace, so arranging one means
+# looking at it. The caller restores the user's real workspace at the end.
+dispatch "hl.dsp.focus({ workspace = \"$WS\" })"
+sleep 0.3
+
+if (( COUNT > 1 )) && [[ "$COMPLETE" == "true" ]]; then
+  # Floating every window empties the tree without closing anything, which is
+  # the only way to choose the insertion order after the fact.
+  while IFS= read -r a; do
+    dispatch "hl.dsp.window.float({ window = \"address:$a\", action = \"on\" })"
+  done < <(jq -r '.[].id' <<<"$RECTS")
+  sleep 0.4
+
+  # The first window back takes the whole workspace; every later one splits a
+  # window that is already placed.
+  dispatch "hl.dsp.window.float({ window = \"address:$ROOT\", action = \"off\" })"
+  sleep 0.25
+
+  while IFS=$'\t' read -r focus dir insert; do
+    [[ -n "$insert" ]] || continue
+    addr_exists "$insert" || continue
+    dispatch "hl.dsp.focus({ window = \"address:$focus\" })"
+    dispatch "hl.dsp.layout(\"preselect $dir\")"
+    dispatch "hl.dsp.window.float({ window = \"address:$insert\", action = \"off\" })"
+    sleep 0.25
+  done < <(jq -r '.steps[] | [.focus, .dir, .insert] | @tsv' <<<"$PLAN")
+fi
+
+# Sizes are split ratios underneath, so setting an outer window's size moves
+# every inner boundary with it. Applying root-first (the plan is already in
+# that order) means each pass only has to correct what the previous one moved,
+# and two passes are enough to settle in practice.
+apply_sizes() {
+  local id w h
+  while IFS=$'\t' read -r id w h; do
+    addr_exists "$id" || continue
+    dispatch "hl.dsp.window.resize({ window = \"address:$id\", x = $w, y = $h, relative = false })"
+  done < <(
+    jq -r --argjson plan "$PLAN" '
+      ([$plan.root] + [$plan.steps[].insert]) as $order
+      | . as $rects
+      | [ $order[] as $id | $rects[] | select(.id == $id) ]
+      | .[] | [.id, .w, .h] | @tsv' <<<"$RECTS"
+  )
+}
+apply_sizes
+sleep 0.2
+apply_sizes

@@ -22,6 +22,7 @@ Usage:
 
 Options for restore:
   --no-agents           Restore windows and panes, start no agents
+  --no-geometry         Restore workspaces only, leave sizes as they land
   --include-uncertain   Also launch windows matched only by window class
   --quiet               Suppress progress output
 

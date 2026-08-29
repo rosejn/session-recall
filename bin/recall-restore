@@ -4,12 +4,14 @@
 set -Eeuo pipefail
 source "$(dirname "$(readlink -f "$0")")/recall-lib"
 
-SNAP_ARG="latest"; DRY=0; WITH_AGENTS=1; INCLUDE_UNCERTAIN=0; QUIET=0; STAGGER="${RECALL_STAGGER:-0.35}"
+SNAP_ARG="latest"; DRY=0; WITH_AGENTS=1; INCLUDE_UNCERTAIN=0; QUIET=0; WITH_GEOMETRY=1
+STAGGER="${RECALL_STAGGER:-0.35}"
 while (($#)); do
   case "$1" in
     --dry-run) DRY=1; shift ;;
     --no-agents) WITH_AGENTS=0; shift ;;
     --include-uncertain) INCLUDE_UNCERTAIN=1; shift ;;
+    --no-geometry) WITH_GEOMETRY=0; shift ;;
     --quiet) QUIET=1; shift ;;
     -*) die "unknown restore option: $1" ;;
     *) SNAP_ARG="$1"; shift ;;
@@ -128,12 +130,13 @@ place_pending() {
   local line class ws addr remaining=0
   local -a still=()
   for line in ${PENDING[@]+"${PENDING[@]}"}; do
-    IFS=$'\t' read -r class ws <<<"$line"
+    IFS=$'\t' read -r class ws idx <<<"$line"
     addr="$(hyprctl -j clients | jq -r --arg c "$class" --argjson k "$CLAIMED" '
       [ .[] | select(.class == $c) | .address ] - $k | .[0] // empty')"
     if [[ -n "$addr" ]]; then
       window_to_workspace "$addr" "$ws"
       claim "$addr"
+      record_geom "$addr" "$idx"
     else
       still+=("$line"); remaining=$((remaining + 1))
     fi
@@ -156,11 +159,25 @@ fi
 LIVE="$(hyprctl -j clients)"
 CLAIMED="$(jq -c '[ .[].address ]' <<<"$LIVE")"
 PENDING=()
+WINS="$(jq -c '.windows' "$J")"
+# Saved geometry paired with the address the window actually came back as.
+# Nothing can be sized until every window has arrived, because a tiled window's
+# size is a property of the tree, not of the window.
+GEOM='[]'
+
+record_geom() {
+  local addr="$1" idx="$2"
+  GEOM="$(jq -c --arg a "$addr" --argjson i "$idx" --argjson w "$WINS" '
+    . + [ ($w[$i] | { id: $a, ws: .workspace.id,
+                      x: .at[0], y: .at[1], w: .size[0], h: .size[1],
+                      floating: .floating, fullscreen: .fullscreen }) ]' <<<"$GEOM")"
+}
 launched=0; reused=0; skipped=0; parked=0
 PARKED_LIST=""
 
 # ------------------------------------------------------------------- windows
 while IFS= read -r w; do
+  idx="$(jq -r   '.idx' <<<"$w")"
   class="$(jq -r '.class' <<<"$w")"
   title="$(jq -r '.title' <<<"$w")"
   ws="$(jq -r    '.workspace.id' <<<"$w")"
@@ -178,6 +195,7 @@ while IFS= read -r w; do
   if [[ -n "$live_addr" ]]; then
     run "window_to_workspace $(printf '%q' "$live_addr") $(printf '%q' "$ws")"
     LIVE="$(jq -c --arg a "$live_addr" 'map(select(.address != $a))' <<<"$LIVE")"
+    record_geom "$live_addr" "$idx"
     reused=$((reused + 1))
     say "  reuse   $class -> workspace $ws"
     continue
@@ -211,7 +229,7 @@ while IFS= read -r w; do
     printf '  would launch: %s  (workspace %s, cwd %s)\n' "$cmd" "$ws" "${cwd:-none}"
   else
     launch_app "$cmd" "$cwd"
-    PENDING+=("$class"$'\t'"$ws")
+    PENDING+=("$class"$'\t'"$ws"$'\t'"$idx")
     # Place anything that has already mapped, so quick apps reach their
     # workspace while the slow ones are still starting.
     place_pending || true
@@ -219,7 +237,7 @@ while IFS= read -r w; do
   launched=$((launched + 1))
   say "  launch  $class -> workspace $ws  [$tier]"
   ((DRY)) || sleep "$STAGGER"
-done < <(jq -c '.windows[]' "$J")
+done < <(jq -c '.windows | to_entries[] | { idx: .key } + .value' "$J")
 
 # Sweep for late arrivals. Leaving a cold-booted browser on whatever workspace
 # happened to be focused is exactly the mess this plugin exists to prevent.
@@ -233,6 +251,55 @@ if ((DRY == 0)) && ((${#PENDING[@]} > 0)); then
   for line in ${PENDING[@]+"${PENDING[@]}"}; do
     say "  note    ${line%%$'\t'*} never appeared in time; left wherever it landed"
   done
+fi
+
+# ------------------------------------------------------------------ geometry
+# Only now, with every window present, can sizes be applied: a tiled window's
+# geometry belongs to the split tree, so one missing window changes all of them.
+if ((WITH_GEOMETRY)) && ((DRY == 0)) && [[ "$(jq 'length' <<<"$GEOM")" != "0" ]]; then
+  say "  restoring window geometry…"
+  geom_tmp="$(mktemp -d)"
+  trap 'rm -rf -- "$geom_tmp"' EXIT
+
+  # Floating windows are the easy half: position and size are their own, so set
+  # them outright. Do them first so they are out of the tiled tree before it is
+  # rebuilt.
+  while IFS=$'\t' read -r id x y w h; do
+    [[ -n "$id" ]] || continue
+    hypr_dispatch "hl.dsp.window.float({ window = \"address:$id\", action = \"on\" })" || true
+    hypr_dispatch "hl.dsp.window.resize({ window = \"address:$id\", x = $w, y = $h, relative = false })" \
+      "resizewindowpixel exact $w $h,address:$id" || true
+    hypr_dispatch "hl.dsp.window.move({ window = \"address:$id\", x = $x, y = $y, relative = false })" \
+      "movewindowpixel exact $x $y,address:$id" || true
+  done < <(jq -r '.[] | select(.floating == true) | [.id, .x, .y, .w, .h] | @tsv' <<<"$GEOM")
+
+  # A workspace running Omarchy's scrolling layout builds its own geometry and
+  # has no dwindle tree to rebuild, so leave those alone.
+  while IFS= read -r wsid; do
+    [[ -n "$wsid" ]] || continue
+    layout="$(jq -r --argjson id "$wsid" '
+      (.workspaces[] | select(.id == $id) | .tiledLayout) // "dwindle"' "$J")"
+    if [[ "$layout" != "dwindle" ]]; then
+      say "  note    workspace $wsid uses the $layout layout; leaving its geometry alone"
+      continue
+    fi
+    jq -c --argjson id "$wsid" '
+      [ .[] | select(.ws == $id and .floating != true)
+            | { id, x, y, w, h } ]' <<<"$GEOM" > "$geom_tmp/ws$wsid.json"
+    [[ "$(jq 'length' "$geom_tmp/ws$wsid.json")" != "0" ]] || continue
+    "$(dirname "$(readlink -f "$0")")/recall-layout" "$wsid" "$geom_tmp/ws$wsid.json" || \
+      say "  note    could not fully rebuild workspace $wsid geometry"
+  done < <(jq -r '[ .[] | select(.floating != true) | .ws ] | unique | .[]' <<<"$GEOM")
+
+  # Fullscreen last: it hides the tree it was applied over, so doing it earlier
+  # would make every later size call operate on a window nobody can see.
+  while IFS=$'\t' read -r id fs; do
+    [[ -n "$id" ]] || continue
+    mode="fullscreen"; [[ "$fs" == "1" ]] && mode="maximized"
+    hypr_dispatch "hl.dsp.window.fullscreen({ window = \"address:$id\", mode = \"$mode\" })" || true
+  done < <(jq -r '.[] | select(.fullscreen != 0 and .fullscreen != null) | [.id, (.fullscreen|tostring)] | @tsv' <<<"$GEOM")
+
+  rm -rf -- "$geom_tmp"; trap - EXIT
 fi
 
 # --------------------------------------------------------------------- herdr

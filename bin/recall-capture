@@ -225,7 +225,7 @@ jq -n \
     # Keyed so a docked and an undocked snapshot never restore over each other.
     monitorTopology: ($monitors | map(.name + ":" + (.width|tostring) + "x" + (.height|tostring)) | sort | join(",")),
     monitors: ($monitors | map({name, id, width, height, x, y, scale, focused})),
-    workspaces: ($workspaces | map({id, name, monitor, windows})),
+    workspaces: ($workspaces | map({id, name, monitor, windows, tiledLayout})),
     windows: $windows,
     terminal: { herdr: $herdr, tmux: $tmux },
     counts: {

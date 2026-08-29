@@ -47,6 +47,34 @@ Restoring reconciles instead of recreating: a window that is already open is
 moved to its saved workspace rather than opened a second time. Restoring twice
 does nothing the second time, which also makes it usable as a tidy-up button.
 
+## Window geometry
+
+Positions and sizes are restored exactly, not just workspace assignment.
+
+That takes more than a resize call. In a tiling layout a window's geometry is a
+property of the split tree, and the tree comes from insertion order — two
+windows side by side and two stacked are the same resize calls but a different
+tree. Ratios alone can never repair a layout that was built in a different
+order.
+
+So Session Recall recovers the tree from the saved rectangles: find the
+straight line that cuts the set cleanly in two, recurse on each side, and emit
+the insertions that rebuild it. Applying it uses a trick — floating every
+window on the workspace empties the tree without closing anything, and each
+window is then un-floated in planned order, against a focused neighbour with
+`preselect` forcing the split direction. A final sizing pass runs outermost
+window first, so each correction only has to fix what the previous one moved.
+
+Floating windows are set outright, and fullscreen is applied last so it does not
+hide the tree being built underneath it.
+
+Verified by scrambling a live workspace — different tree, different sizes,
+different order — and restoring it back to a byte-identical `hyprctl clients`
+dump. Expect the odd 1–2px difference where gaps round.
+
+Workspaces running Omarchy's `scrolling` layout build their own geometry and are
+left alone. `--no-geometry` skips the whole pass.
+
 ## Agents
 
 Terminal backends are detected, never required — herdr, tmux, or neither.
