@@ -100,7 +100,9 @@ cmd_status() {
     "Monitors: \(.monitorTopology)",
     "",
     "WINDOWS",
-    (.windows[] | "  [\(.launch.tier | (. + "        ")[0:7])] ws\(.workspace.id)  \(.class)\n            \(.launch.command // ((.launch.argv // []) | join(" ")) | .[0:96])"),
+    (.windows[] | "  [\(.launch.tier | (. + "        ")[0:7])] ws\(.workspace.id)  \(.class)\n            \(
+        (if (.launch.command // "") != "" then .launch.command
+         else ((.launch.argv // []) | join(" ")) end) | .[0:96])"),
     "",
     "AGENTS"
   ' "$d/snapshot.json"
