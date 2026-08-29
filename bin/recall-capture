@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# Build one snapshot of the current desktop. Prints the snapshot directory.
+set -Eeuo pipefail
+source "$(dirname "$(readlink -f "$0")")/recall-lib"
+
+LABEL=""; KIND="named"; SCROLLBACK="${RECALL_SCROLLBACK:-2000}"
+while (($#)); do
+  case "$1" in
+    --label) LABEL="${2:?--label needs a value}"; shift 2 ;;
+    --auto)  KIND="auto"; shift ;;
+    --scrollback) SCROLLBACK="${2:?}"; shift 2 ;;
+    *) die "unknown capture option: $1" ;;
+  esac
+done
+
+have jq || die "jq is required"
+have hyprctl || die "hyprctl is required (this plugin targets Hyprland)"
+
+if [[ "$KIND" == "auto" ]]; then
+  NAME="auto-$(date +%Y%m%d-%H%M%S)"
+else
+  NAME="${LABEL:-$(date +%Y%m%d-%H%M%S)}"
+  [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]*$ ]] || die "name may contain only letters, numbers, spaces, dot, underscore, dash"
+  [[ "$NAME" != "latest" ]] || die "'latest' is reserved"
+fi
+
+mkdir -p "$RECALL_SNAPS"
+DEST="$RECALL_SNAPS/$NAME"
+TMP="$(mktemp -d "$RECALL_SNAPS/.tmp.XXXXXX")"
+trap 'rm -rf -- "$TMP"' EXIT
+mkdir -p "$TMP/scrollback"
+
+CLIENTS="$(hyprctl -j clients)"
+WORKSPACES="$(hyprctl -j workspaces)"
+MONITORS="$(hyprctl -j monitors)"
+ACTIVE="$(hyprctl -j activewindow 2>/dev/null || echo '{}')"
+IGNORE="$(ignore_classes_json)"
+
+# ------------------------------------------------------------------ web apps
+# Omarchy encodes a web app's URL into the Chromium window class
+# ("chrome-discord.com__channels_@me-Default"). Decoding that back to a URL and
+# matching it against the .desktop that launched it is the only way to tell
+# sibling PWA windows apart: they all share one browser pid, so /proc has
+# nothing per-window to offer.
+declare -A WEBAPP_BY_HOSTPATH=()
+while IFS=$'\t' read -r url exec_line; do
+  [[ -n "$url" ]] || continue
+  key="${url#*://}"; key="${key%/}"
+  WEBAPP_BY_HOSTPATH["$key"]="$exec_line"
+done < <(
+  for f in "$HOME/.local/share/applications"/*.desktop /usr/share/applications/*.desktop; do
+    [[ -f "$f" ]] || continue
+    e="$(grep -m1 '^Exec=' "$f" 2>/dev/null || true)"; e="${e#Exec=}"
+    [[ -n "$e" ]] || continue
+    u="$(grep -oE 'https?://[^ "]+' <<<"$e" | head -1 || true)"
+    [[ -n "$u" ]] && printf '%s\t%s\n' "$u" "$e"
+  done
+)
+
+decode_webapp_class() {
+  # chrome-<host><path with / as _>-<profile>  ->  host/path
+  local class="$1" body
+  [[ "$class" == chrome-* ]] || return 1
+  body="${class#chrome-}"
+  body="${body%-Default}"; body="${body%-Profile*}"
+  [[ "$body" == *.* ]] || return 1          # an app-id hash, not a hostname
+  body="${body//__//}"
+  body="${body//_//}"
+  while [[ "$body" == *"//"* ]]; do body="${body//\/\///}"; done
+  printf '%s' "${body%/}"
+}
+
+# --------------------------------------------------------------- window pass
+# A pid shared by several windows (Chromium, Electron) tells us nothing about
+# any one of them, so exact-argv restore is only offered to sole owners.
+declare -A PID_WINDOWS=()
+while IFS= read -r p; do
+  [[ -n "$p" && "$p" != "0" ]] && PID_WINDOWS[$p]=$(( ${PID_WINDOWS[$p]:-0} + 1 ))
+done < <(jq -r '.[].pid' <<<"$CLIENTS")
+
+desktop_for_class() {
+  local class="$1" f base
+  for f in "$HOME/.local/share/applications"/*.desktop /usr/share/applications/*.desktop; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f" .desktop)"
+    if [[ "${base,,}" == "${class,,}" ]] \
+      || grep -qiE "^StartupWMClass=${class}$" "$f" 2>/dev/null; then
+      printf '%s' "$base"; return 0
+    fi
+  done
+  return 1
+}
+
+WINDOWS_JSON="$TMP/windows.json"; printf '[]' > "$WINDOWS_JSON"
+add_window() { jq -c --argjson w "$1" '. + [$w]' "$WINDOWS_JSON" > "$WINDOWS_JSON.n" && mv "$WINDOWS_JSON.n" "$WINDOWS_JSON"; }
+
+ACTIVE_ADDR="$(jq -r '.address // ""' <<<"$ACTIVE")"
+
+while IFS= read -r client; do
+  class="$(jq -r '.class // ""' <<<"$client")"
+  addr="$(jq -r  '.address // ""' <<<"$client")"
+  pid="$(jq -r   '.pid // 0' <<<"$client")"
+  title="$(jq -r '.title // ""' <<<"$client")"
+
+  tier="none"; cmd=""; cwd=""; argv_json="null"; reason=""
+
+  hostpath="$(decode_webapp_class "$class" 2>/dev/null || true)"
+  if [[ -n "$hostpath" && -n "${WEBAPP_BY_HOSTPATH[$hostpath]:-}" ]]; then
+    tier="webapp"; cmd="${WEBAPP_BY_HOSTPATH[$hostpath]}"
+    reason="class decoded to $hostpath and matched a desktop entry"
+  elif [[ "$pid" != "0" && "${PID_WINDOWS[$pid]:-0}" -eq 1 ]] && argv_json="$(proc_argv_json "$pid")" && [[ "$argv_json" != "[]" ]]; then
+    tier="exact"
+    cwd="$(proc_cwd "$pid" 2>/dev/null || true)"
+    reason="sole window of pid $pid; argv and cwd read from /proc"
+  else
+    argv_json="null"
+    if desk="$(desktop_for_class "$class" 2>/dev/null)"; then
+      tier="guess"; cmd="gtk-launch $desk"
+      reason="matched desktop entry $desk by window class"
+    else
+      reason="no argv (pid shared or unreadable) and no desktop entry for class"
+    fi
+  fi
+
+  add_window "$(jq -nc \
+    --argjson c "$client" \
+    --arg tier "$tier" --arg cmd "$cmd" --arg cwd "$cwd" \
+    --arg reason "$reason" --argjson argv "${argv_json:-null}" \
+    --arg activeAddr "$ACTIVE_ADDR" '
+    {
+      address: $c.address, class: $c.class, initialClass: $c.initialClass,
+      title: $c.title, pid: $c.pid,
+      workspace: $c.workspace, at: $c.at, size: $c.size,
+      floating: $c.floating, fullscreen: $c.fullscreen, monitor: $c.monitor,
+      pinned: $c.pinned, xwayland: $c.xwayland,
+      focused: ($c.address == $activeAddr),
+      launch: { tier: $tier, command: $cmd, cwd: $cwd, argv: $argv, reason: $reason }
+    }')"
+done < <(jq -c --argjson ig "$IGNORE" '.[] | select(.class as $c | $ig | index($c) == null)' <<<"$CLIENTS")
+
+# ------------------------------------------------------------- herdr backend
+HERDR_JSON='{"available":false}'
+if have herdr && herdr_snap="$(timeout 5 herdr api snapshot 2>/dev/null)" && [[ -n "$herdr_snap" ]]; then
+  snap="$(jq -c '.result.snapshot // empty' <<<"$herdr_snap" 2>/dev/null || true)"
+  if [[ -n "$snap" ]]; then
+    panes='[]'
+    while IFS= read -r pane_id; do
+      [[ -n "$pane_id" ]] || continue
+      info="$(timeout 5 herdr pane process-info --pane "$pane_id" 2>/dev/null || true)"
+      shell_pid="$(jq -r '.result.process_info.shell_pid // empty' <<<"$info" 2>/dev/null || true)"
+      pcwd="$(jq -r --arg p "$pane_id" '.panes[] | select(.pane_id == $p) | .cwd // ""' <<<"$snap")"
+      ptitle="$(jq -r --arg p "$pane_id" '.panes[] | select(.pane_id == $p) | .terminal_title_stripped // .terminal_title // ""' <<<"$snap")"
+      kind=""; sid=""; method=""; sfile=""
+      if [[ -n "$shell_pid" ]] && identify_agent "$shell_pid" "$pcwd" "$ptitle"; then
+        kind="$AGENT_KIND"; sid="$AGENT_SESSION_ID"; method="$AGENT_METHOD"; sfile="$AGENT_SESSION_FILE"
+      fi
+      # Scrollback is the "what was I doing" record; it is why the state dir is 0700.
+      timeout 5 herdr pane read "$pane_id" > "$TMP/scrollback/herdr-${pane_id//:/-}.txt" 2>/dev/null || true
+      panes="$(jq -c --arg id "$pane_id" --arg cwd "$pcwd" --arg title "$ptitle" \
+        --arg kind "$kind" --arg sid "$sid" --arg method "$method" --arg sfile "$sfile" \
+        --argjson snap "$snap" '
+        . + [ ($snap.panes[] | select(.pane_id == $id)) + {
+                agentKind: $kind, agentSessionId: $sid,
+                agentMethod: $method, agentSessionFile: $sfile } ]' <<<"$panes")"
+    done < <(jq -r '.panes[].pane_id' <<<"$snap")
+    HERDR_JSON="$(jq -nc --argjson snap "$snap" --argjson panes "$panes" '{
+      available: true, protocol: ($snap.protocol // 0), version: ($snap.version // ""),
+      workspaces: ($snap.workspaces // []), tabs: ($snap.tabs // []),
+      focusedWorkspaceId: ($snap.focused_workspace_id // ""),
+      focusedPaneId: ($snap.focused_pane_id // ""),
+      panes: $panes }')"
+  fi
+fi
+
+# -------------------------------------------------------------- tmux backend
+TMUX_JSON='{"available":false}'
+if have tmux && tmux list-sessions >/dev/null 2>&1; then
+  sessions='[]'
+  while IFS= read -r sname; do
+    [[ -n "$sname" ]] || continue
+    windows='[]'
+    while IFS=$'\t' read -r widx wname wactive wlayout; do
+      [[ -n "$widx" ]] || continue
+      tpanes='[]'
+      while IFS=$'\t' read -r pidx pactive ppath ptitle pcmd ppid; do
+        [[ -n "$pidx" ]] || continue
+        kind=""; sid=""; method=""; sfile=""
+        if [[ -n "$ppid" ]] && identify_agent "$ppid" "$ppath" "$ptitle"; then
+          kind="$AGENT_KIND"; sid="$AGENT_SESSION_ID"; method="$AGENT_METHOD"; sfile="$AGENT_SESSION_FILE"
+        fi
+        tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$sname:$widx.$pidx" \
+          > "$TMP/scrollback/tmux-${sname}-${widx}-${pidx}.txt" 2>/dev/null || true
+        tpanes="$(jq -c --arg i "$pidx" --arg a "$pactive" --arg c "$ppath" --arg t "$ptitle" \
+          --arg cmd "$pcmd" --arg kind "$kind" --arg sid "$sid" --arg m "$method" --arg f "$sfile" '
+          . + [{ index: ($i|tonumber), active: ($a == "1"), cwd: $c, title: $t, command: $cmd,
+                 agentKind: $kind, agentSessionId: $sid, agentMethod: $m, agentSessionFile: $f }]' <<<"$tpanes")"
+      done < <(tmux list-panes -t "$sname:$widx" -F '#{pane_index}	#{pane_active}	#{pane_current_path}	#{pane_title}	#{pane_current_command}	#{pane_pid}')
+      windows="$(jq -c --arg i "$widx" --arg n "$wname" --arg a "$wactive" --arg l "$wlayout" --argjson p "$tpanes" '
+        . + [{ index: ($i|tonumber), name: $n, active: ($a == "1"), layout: $l, panes: $p }]' <<<"$windows")"
+    done < <(tmux list-windows -t "$sname" -F '#{window_index}	#{window_name}	#{window_active}	#{window_layout}')
+    sessions="$(jq -c --arg n "$sname" --argjson w "$windows" '. + [{ name: $n, windows: $w }]' <<<"$sessions")"
+  done < <(tmux list-sessions -F '#{session_name}')
+  TMUX_JSON="$(jq -nc --argjson s "$sessions" '{ available: true, sessions: $s }')"
+fi
+
+# --------------------------------------------------------------------- write
+printf '%s\n' "$RECALL_FORMAT" > "$TMP/format-version"
+jq -n \
+  --arg version "$RECALL_VERSION" --argjson format "$RECALL_FORMAT" \
+  --arg name "$NAME" --arg kind "$KIND" \
+  --arg createdAt "$(date --iso-8601=seconds)" --arg hostname "$(hostname)" \
+  --argjson windows "$(cat "$WINDOWS_JSON")" \
+  --argjson workspaces "$WORKSPACES" --argjson monitors "$MONITORS" \
+  --argjson herdr "$HERDR_JSON" --argjson tmux "$TMUX_JSON" '
+  {
+    formatVersion: $format, version: $version, name: $name, kind: $kind,
+    createdAt: $createdAt, hostname: $hostname,
+    # Keyed so a docked and an undocked snapshot never restore over each other.
+    monitorTopology: ($monitors | map(.name + ":" + (.width|tostring) + "x" + (.height|tostring)) | sort | join(",")),
+    monitors: ($monitors | map({name, id, width, height, x, y, scale, focused})),
+    workspaces: ($workspaces | map({id, name, monitor, windows})),
+    windows: $windows,
+    terminal: { herdr: $herdr, tmux: $tmux },
+    counts: {
+      windows: ($windows | length),
+      restorable: ($windows | map(select(.launch.tier == "exact" or .launch.tier == "webapp")) | length),
+      uncertain: ($windows | map(select(.launch.tier == "guess")) | length),
+      unknown: ($windows | map(select(.launch.tier == "none")) | length),
+      agents: (($herdr.panes // []) + (($tmux.sessions // []) | map(.windows[].panes[]))
+               | map(select(.agentKind != null and .agentKind != "")) | length),
+      agentsResumable: (($herdr.panes // []) + (($tmux.sessions // []) | map(.windows[].panes[]))
+               | map(select((.agentSessionId // "") != "" or (.agentMethod // "") == "continue")) | length)
+    }
+  }' > "$TMP/snapshot.json"
+
+chmod -R go-rwx "$TMP"
+rm -rf -- "$DEST"
+mv "$TMP" "$DEST"
+trap - EXIT
+
+mkdir -p "$RECALL_STATE"
+ln -sfn "$DEST" "$RECALL_STATE/.latest.$$" && mv -Tf "$RECALL_STATE/.latest.$$" "$RECALL_STATE/latest"
+[[ "$KIND" == "auto" ]] && { ln -sfn "$DEST" "$RECALL_STATE/.lastauto.$$" && mv -Tf "$RECALL_STATE/.lastauto.$$" "$RECALL_STATE/last-auto"; }
+
+printf '%s\n' "$DEST"

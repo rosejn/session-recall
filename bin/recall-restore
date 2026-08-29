@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Bring a snapshot back. Reconciles against what is already running rather
+# than recreating blindly, so restoring twice is a no-op instead of a mess.
+set -Eeuo pipefail
+source "$(dirname "$(readlink -f "$0")")/recall-lib"
+
+SNAP_ARG="latest"; DRY=0; WITH_AGENTS=1; INCLUDE_UNCERTAIN=0; QUIET=0; STAGGER="${RECALL_STAGGER:-0.35}"
+while (($#)); do
+  case "$1" in
+    --dry-run) DRY=1; shift ;;
+    --no-agents) WITH_AGENTS=0; shift ;;
+    --include-uncertain) INCLUDE_UNCERTAIN=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    -*) die "unknown restore option: $1" ;;
+    *) SNAP_ARG="$1"; shift ;;
+  esac
+done
+
+have jq || die "jq is required"
+have hyprctl || die "hyprctl is required"
+
+resolve_snapshot() {
+  local want="$1" c
+  case "$want" in
+    latest)    c="$RECALL_STATE/latest" ;;
+    last-auto) c="$RECALL_STATE/last-auto" ;;
+    */*)       c="$want" ;;
+    *)         c="$RECALL_SNAPS/$want" ;;
+  esac
+  [[ -d "$c" ]] || die "snapshot not found: $want"
+  c="$(cd "$c" && pwd -P)"
+  [[ -f "$c/snapshot.json" ]] || die "not a recall snapshot: $c"
+  [[ "$(<"$c/format-version")" == "$RECALL_FORMAT" ]] || die "unsupported snapshot format in $c"
+  printf '%s' "$c"
+}
+
+# Hyprland 0.56 routes `hyprctl dispatch` through Lua (`hl.dsp.*`); the old
+# positional form is gone. Omarchy's own scripts keep a legacy fallback, so we
+# do too -- an older Hyprland should still restore, just without silent moves.
+# herdr's own `agent start` requires a pane "at its interactive shell prompt".
+# Mirror that check before typing anything: a pane running make, ssh, or an
+# editor must not receive a resume command as keystrokes.
+pane_at_shell_prompt() {
+  local pane="$1" info fg
+  info="$(timeout 5 herdr pane process-info --pane "$pane" 2>/dev/null || true)"
+  [[ -n "$info" ]] || return 1
+  fg="$(jq -r '[.result.process_info.foreground_processes[]?.name] | join(",")' <<<"$info" 2>/dev/null || true)"
+  # No foreground process beyond the shell itself is the clean case.
+  [[ -z "$fg" ]] && return 0
+  case ",$fg," in
+    *,bash,*|*,fish,*|*,zsh,*|*,sh,*|*,dash,*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+hypr_dispatch() {
+  local lua="$1" legacy="${2:-}"
+  hyprctl dispatch "$lua" >/dev/null 2>&1 && return 0
+  [[ -n "$legacy" ]] || return 1
+  hyprctl dispatch $legacy >/dev/null 2>&1
+}
+
+window_to_workspace() {
+  local addr="$1" ws="$2"
+  hypr_dispatch \
+    "hl.dsp.window.move({ window = \"address:$addr\", workspace = \"$ws\", follow = false })" \
+    "movetoworkspacesilent $ws,address:$addr"
+}
+
+focus_workspace() {
+  local ws="$1"
+  hypr_dispatch "hl.dsp.focus({ workspace = \"$ws\" })" "workspace $ws"
+}
+
+# Launching goes through uwsm-app like every other Omarchy launcher, so restored
+# apps sit in the same systemd scope as ones started from the menu -- not as
+# children of the shell, which would take them all down with it.
+launch_app() {
+  local cmd="$1" cwd="$2"
+  local wrapped="$cmd"
+  [[ -n "$cwd" && "$cwd" != "/" && -d "$cwd" ]] && wrapped="cd $(printf '%q' "$cwd") && exec $cmd"
+  setsid uwsm-app -- bash -lc "$wrapped" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# Wait for a window of this class to appear so it can be placed. Restores stay
+# ordered instead of racing every launch at once.
+await_window() {
+  local class="$1" known="$2" deadline=$((SECONDS + 8)) addr
+  while ((SECONDS < deadline)); do
+    addr="$(hyprctl -j clients | jq -r --arg c "$class" --argjson k "$known" '
+      [ .[] | select(.class == $c) | .address ] - $k | .[0] // empty')"
+    [[ -n "$addr" ]] && { printf '%s' "$addr"; return 0; }
+    sleep 0.25
+  done
+  return 1
+}
+
+SNAP="$(resolve_snapshot "$SNAP_ARG")"
+J="$SNAP/snapshot.json"
+say() { ((QUIET)) || printf '%s\n' "$*"; }
+run() { if ((DRY)); then printf '  would run: %s\n' "$*"; else eval "$@"; fi; }
+
+saved_topology="$(jq -r '.monitorTopology' "$J")"
+live_topology="$(hyprctl -j monitors | jq -r 'map(.name + ":" + (.width|tostring) + "x" + (.height|tostring)) | sort | join(",")')"
+if [[ "$saved_topology" != "$live_topology" ]]; then
+  say "note: monitors changed since this snapshot ($saved_topology -> $live_topology); windows land on their saved workspace, which may sit on a different screen."
+fi
+
+LIVE="$(hyprctl -j clients)"
+launched=0; reused=0; skipped=0; parked=0
+PARKED_LIST=""
+
+# ------------------------------------------------------------------- windows
+while IFS= read -r w; do
+  class="$(jq -r '.class' <<<"$w")"
+  title="$(jq -r '.title' <<<"$w")"
+  ws="$(jq -r    '.workspace.id' <<<"$w")"
+  tier="$(jq -r  '.launch.tier' <<<"$w")"
+  cmd="$(jq -r   '.launch.command // ""' <<<"$w")"
+  cwd="$(jq -r   '.launch.cwd // ""' <<<"$w")"
+
+  # Already on screen? Move it instead of starting a second copy. Title is a
+  # weak key on its own, so class must agree too.
+  live_addr="$(jq -r --arg c "$class" --arg t "$title" '
+    [ .[] | select(.class == $c) ] as $same
+    | (($same[] | select(.title == $t) | .address), ($same[0].address // empty))
+    | select(. != null)' <<<"$LIVE" | head -1)"
+
+  if [[ -n "$live_addr" ]]; then
+    run "window_to_workspace $(printf '%q' "$live_addr") $(printf '%q' "$ws")"
+    LIVE="$(jq -c --arg a "$live_addr" 'map(select(.address != $a))' <<<"$LIVE")"
+    reused=$((reused + 1))
+    say "  reuse   $class -> workspace $ws"
+    continue
+  fi
+
+  case "$tier" in
+    exact)
+      # argv is already the exact process that was running; rebuild it verbatim
+      # so flags like foot's --working-directory survive.
+      mapfile -t argv < <(jq -r '.launch.argv[]?' <<<"$w")
+      ((${#argv[@]})) || { skipped=$((skipped + 1)); continue; }
+      printf -v cmd '%q ' "${argv[@]}"; cmd="${cmd% }"
+      ;;
+    webapp) ;;   # command already carries the URL
+    guess)
+      if ((INCLUDE_UNCERTAIN)); then :; else
+        parked=$((parked + 1)); PARKED_LIST+="${PARKED_LIST:+, }$class"
+        say "  park    $class (uncertain: $(jq -r '.launch.reason' <<<"$w"))"
+        continue
+      fi
+      ;;
+    *)
+      skipped=$((skipped + 1))
+      say "  skip    $class ($(jq -r '.launch.reason' <<<"$w"))"
+      continue
+      ;;
+  esac
+
+  [[ -n "$cmd" ]] || { skipped=$((skipped + 1)); continue; }
+  if ((DRY)); then
+    printf '  would launch: %s  (workspace %s, cwd %s)\n' "$cmd" "$ws" "${cwd:-none}"
+  else
+    known="$(hyprctl -j clients | jq -c --arg c "$class" '[ .[] | select(.class == $c) | .address ]')"
+    launch_app "$cmd" "$cwd"
+    # Placing after the window maps costs a brief flash on the current
+    # workspace, but it is the only way that works without a preloaded rule.
+    if new_addr="$(await_window "$class" "$known")"; then
+      window_to_workspace "$new_addr" "$ws"
+    else
+      say "  note    $class did not appear within 8s; left wherever it lands"
+    fi
+  fi
+  launched=$((launched + 1))
+  say "  launch  $class -> workspace $ws  [$tier]"
+  ((DRY)) || sleep "$STAGGER"
+done < <(jq -c '.windows[]' "$J")
+
+# --------------------------------------------------------------------- herdr
+# herdr's own server already restores workspaces, tabs, panes and their cwds
+# from its session.json. What it does not restore is which agent was living in
+# each pane, so that is all we add back.
+if ((WITH_AGENTS)) && [[ "$(jq -r '.terminal.herdr.available' "$J")" == "true" ]] && have herdr; then
+  saved_proto="$(jq -r '.terminal.herdr.protocol' "$J")"
+  live_proto="$(timeout 5 herdr api snapshot 2>/dev/null | jq -r '.result.snapshot.protocol // 0' 2>/dev/null || echo 0)"
+  if [[ "$live_proto" == "0" ]]; then
+    say "  herdr   not answering; skipping agent resume"
+  elif [[ "$saved_proto" != "$live_proto" ]]; then
+    say "  herdr   protocol changed ($saved_proto -> $live_proto); skipping agent resume"
+  else
+    # A pane that already has an agent in it is NOT a place to type a resume
+    # command: the text lands in the running agent's prompt box and becomes a
+    # message to it. Only panes sitting at a shell prompt are eligible.
+    live_snapshot="$(timeout 5 herdr api snapshot 2>/dev/null || echo '{}')"
+    busy_panes="$(jq -r '.result.snapshot.panes[]? | select((.agent // "") != "") | .pane_id' <<<"$live_snapshot" 2>/dev/null || true)"
+    while IFS= read -r p; do
+      pane="$(jq -r '.pane_id' <<<"$p")"
+      kind="$(jq -r '.agentKind // ""' <<<"$p")"
+      sid="$(jq -r  '.agentSessionId // ""' <<<"$p")"
+      method="$(jq -r '.agentMethod // ""' <<<"$p")"
+      sfile="$(jq -r '.agentSessionFile // ""' <<<"$p")"
+      [[ -n "$kind" ]] || continue
+
+      if [[ "$method" != "continue" ]] && ! agent_session_alive "$kind" "$sid" "$sfile"; then
+        say "  agent   $pane: $kind session $sid is gone; leaving a shell"
+        continue
+      fi
+      resume="$(agent_resume_command "$kind" "$sid" "$method" || true)"
+      [[ -n "$resume" ]] || { say "  agent   $pane: cannot rebuild a $kind resume; leaving a shell"; continue; }
+
+      # A pane that is missing means herdr's own layout restore did not put it
+      # back; do not invent one, the topology is herdr's to own.
+      if ! timeout 5 herdr pane get "$pane" >/dev/null 2>&1; then
+        say "  agent   $pane: pane not present after herdr restore; skipping"
+        continue
+      fi
+      if grep -qxF "$pane" <<<"$busy_panes"; then
+        say "  agent   $pane: already running an agent; left alone"
+        continue
+      fi
+      if ! pane_at_shell_prompt "$pane"; then
+        say "  agent   $pane: busy with another process; left alone"
+        continue
+      fi
+      # `pane run` sends the text and the Enter in one call, so a resume can
+      # never be left half-typed at the prompt.
+      run "timeout 10 herdr pane run $(printf '%q' "$pane") $(printf '%q' "$resume") >/dev/null"
+      say "  agent   $pane: $kind ($method${sid:+ $sid})"
+    done < <(jq -c '.terminal.herdr.panes[]? | select((.agentKind // "") != "")' "$J")
+  fi
+fi
+
+# ---------------------------------------------------------------------- tmux
+if ((WITH_AGENTS)) && [[ "$(jq -r '.terminal.tmux.available' "$J")" == "true" ]] && have tmux; then
+  while IFS= read -r s; do
+    sname="$(jq -r '.name' <<<"$s")"
+    if tmux has-session -t "=$sname" 2>/dev/null; then
+      say "  tmux    session '$sname' is already live; left alone"
+      continue
+    fi
+    first_window=1
+    while IFS= read -r win; do
+      widx="$(jq -r '.index' <<<"$win")"; wname="$(jq -r '.name' <<<"$win")"
+      layout="$(jq -r '.layout' <<<"$win")"
+      fcwd="$(jq -r '.panes[0].cwd // ""' <<<"$win")"
+      [[ -d "$fcwd" ]] || fcwd="$HOME"
+      if ((first_window)); then
+        run "tmux new-session -d -s $(printf '%q' "$sname") -n $(printf '%q' "$wname") -c $(printf '%q' "$fcwd")"
+        first_window=0
+      else
+        run "tmux new-window -d -t $(printf '%q' "$sname:$widx") -n $(printf '%q' "$wname") -c $(printf '%q' "$fcwd")"
+      fi
+      n="$(jq -r '.panes | length' <<<"$win")"
+      for ((i = 1; i < n; i++)); do
+        pcwd="$(jq -r --argjson i "$i" '.panes[$i].cwd // ""' <<<"$win")"
+        [[ -d "$pcwd" ]] || pcwd="$HOME"
+        run "tmux split-window -d -t $(printf '%q' "$sname:$widx") -c $(printf '%q' "$pcwd")"
+      done
+      run "tmux select-layout -t $(printf '%q' "$sname:$widx") $(printf '%q' "$layout") >/dev/null 2>&1 || true"
+      for ((i = 0; i < n; i++)); do
+        kind="$(jq -r --argjson i "$i" '.panes[$i].agentKind // ""' <<<"$win")"
+        [[ -n "$kind" ]] || continue
+        sid="$(jq -r --argjson i "$i" '.panes[$i].agentSessionId // ""' <<<"$win")"
+        method="$(jq -r --argjson i "$i" '.panes[$i].agentMethod // ""' <<<"$win")"
+        sfile="$(jq -r --argjson i "$i" '.panes[$i].agentSessionFile // ""' <<<"$win")"
+        if [[ "$method" != "continue" ]] && ! agent_session_alive "$kind" "$sid" "$sfile"; then
+          say "  agent   $sname:$widx.$i: $kind session gone; leaving a shell"; continue
+        fi
+        resume="$(agent_resume_command "$kind" "$sid" "$method" || true)"
+        [[ -n "$resume" ]] || continue
+        run "tmux send-keys -t $(printf '%q' "$sname:$widx.$i") -l $(printf '%q' "$resume")"
+        run "tmux send-keys -t $(printf '%q' "$sname:$widx.$i") Enter"
+        say "  agent   $sname:$widx.$i: $kind ($method)"
+      done
+    done < <(jq -c '.windows[]' <<<"$s")
+  done < <(jq -c '.terminal.tmux.sessions[]?' "$J")
+fi
+
+# ------------------------------------------------------------------- wrap up
+focus_ws="$(jq -r '.windows[] | select(.focused) | .workspace.id' "$J" | head -1)"
+[[ -n "$focus_ws" ]] && run "focus_workspace $(printf '%q' "$focus_ws")"
+
+say ""
+say "Restored from $(jq -r '.name' "$J") ($(jq -r '.createdAt' "$J"))"
+say "  $launched launched, $reused already running, $parked parked as uncertain, $skipped skipped"
+if ((parked > 0 && DRY == 0)) && have notify-send; then
+  notify-send -a "Session Recall" "Session Recall" \
+    "$parked window(s) I could not identify confidently were not restored: $PARKED_LIST. Run 'recall restore --include-uncertain' to launch them anyway." || true
+fi

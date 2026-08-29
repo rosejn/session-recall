@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# Shared helpers for session-recall. Sourced, never executed.
+
+RECALL_VERSION="0.3.0"
+RECALL_FORMAT=1
+RECALL_STATE="${RECALL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-recall}"
+RECALL_SNAPS="$RECALL_STATE/snapshots"
+RECALL_CONFIG="$RECALL_STATE/config.json"
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+# Snapshots hold scrollback, which holds whatever was on screen. Treat the
+# whole state tree as private the way devteam did.
+umask 077
+
+die()  { printf 'recall: error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'recall: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Windows that exist because the desktop exists, not because you opened them.
+# Restoring these fights the shell that already owns them.
+RECALL_IGNORE_CLASSES_DEFAULT='[
+  "quickshell","omarchy-shell","xdg-desktop-portal-hyprland",
+  "hyprland-share-picker","hyprland-preview-share-picker",
+  "polkit-gnome-authentication-agent-1","org.freedesktop.impl.portal.desktop.hyprland",
+  "waybar","rofi","wofi","fuzzel","walker","dunst","mako","swaync",
+  "omarchy-screensaver","hyprlock","gcr-prompter","xwaylandvideobridge"
+]'
+
+config_get() {
+  local key="$1" fallback="$2"
+  [[ -f "$RECALL_CONFIG" ]] || { printf '%s' "$fallback"; return; }
+  jq -r --arg k "$key" --arg d "$fallback" \
+    'if (.[$k] == null) then $d else (.[$k]|tostring) end' "$RECALL_CONFIG" 2>/dev/null \
+    || printf '%s' "$fallback"
+}
+
+config_set() {
+  local key="$1" value="$2" tmp
+  mkdir -p "$RECALL_STATE"
+  [[ -f "$RECALL_CONFIG" ]] || printf '{}\n' > "$RECALL_CONFIG"
+  tmp="$(mktemp "$RECALL_STATE/.config.XXXXXX")"
+  # Booleans and numbers must land as JSON scalars, not strings, so the QML
+  # side can read them without a second round of parsing.
+  if [[ "$value" == "true" || "$value" == "false" || "$value" =~ ^-?[0-9]+$ ]]; then
+    jq --arg k "$key" --argjson v "$value" '.[$k] = $v' "$RECALL_CONFIG" > "$tmp"
+  else
+    jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$RECALL_CONFIG" > "$tmp"
+  fi
+  mv -f "$tmp" "$RECALL_CONFIG"
+}
+
+ignore_classes_json() {
+  if [[ -f "$RECALL_CONFIG" ]]; then
+    jq -c --argjson d "$RECALL_IGNORE_CLASSES_DEFAULT" \
+      '(.ignoreClasses // []) + $d | unique' "$RECALL_CONFIG" 2>/dev/null && return
+  fi
+  jq -cn --argjson d "$RECALL_IGNORE_CLASSES_DEFAULT" '$d | unique'
+}
+
+# ---------------------------------------------------------------- /proc reads
+
+proc_argv_json() {
+  local pid="$1"
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  # cmdline is NUL-separated with a trailing NUL; jq's split leaves an empty
+  # tail element that would become a bogus empty argv entry.
+  tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+    | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || return 1
+}
+
+proc_cwd() {
+  local pid="$1" cwd
+  cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || return 1
+  # A dead or namespaced process can leave cwd pointing at nonsense such as
+  # /proc/N/fdinfo; only a real directory is worth restoring into.
+  [[ -n "$cwd" && -d "$cwd" ]] || return 1
+  printf '%s' "$cwd"
+}
+
+proc_children() {
+  local pid="$1"
+  [[ -r "/proc/$pid/task/$pid/children" ]] || return 0
+  tr ' ' '\n' < "/proc/$pid/task/$pid/children" 2>/dev/null | grep -E '^[0-9]+$' || true
+}
+
+# --------------------------------------------------------------- agent lookup
+
+RECALL_AGENT_KINDS="claude codex pi opencode gemini crush amp droid qwen"
+
+classify_agent_pid() {
+  local pid="$1" argv token base
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    base="${token##*/}"
+    case "$base" in
+      claude|claude.exe) printf 'claude\n'; return 0 ;;
+      codex)             printf 'codex\n';  return 0 ;;
+      pi)                printf 'pi\n';     return 0 ;;
+      opencode)          printf 'opencode\n'; return 0 ;;
+      gemini)            printf 'gemini\n'; return 0 ;;
+      crush)             printf 'crush\n';  return 0 ;;
+      amp)               printf 'amp\n';    return 0 ;;
+    esac
+    case "$token" in
+      */claude-code/*)  printf 'claude\n'; return 0 ;;
+      */@openai/codex/*) printf 'codex\n'; return 0 ;;
+    esac
+  done < <(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null)
+  return 1
+}
+
+# Breadth-first walk down the process tree. A pane's shell is the root; the
+# agent is usually one or two levels below it, under fish/bash and sometimes a
+# version-manager shim.
+discover_agent() {
+  local root_pid="$1" pid child kind
+  local -a queue=("$root_pid")
+  AGENT_PID=""; AGENT_KIND=""
+  [[ -d "/proc/$root_pid" ]] || return 1
+  while ((${#queue[@]})); do
+    pid="${queue[0]}"; queue=("${queue[@]:1}")
+    if kind="$(classify_agent_pid "$pid" 2>/dev/null)"; then
+      AGENT_PID="$pid"; AGENT_KIND="$kind"; return 0
+    fi
+    while IFS= read -r child; do
+      [[ -n "$child" && -d "/proc/$child" ]] && queue+=("$child")
+    done < <(proc_children "$pid")
+  done
+  return 1
+}
+
+# Tier 1: the id is sitting right there in argv because the session was itself
+# resumed. Cheapest and most trustworthy signal available.
+explicit_resume_id() {
+  local kind="$1" pid="$2" i token next
+  local -a argv=()
+  mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    token="${argv[$i]}"; next="${argv[$((i + 1))]:-}"
+    case "$kind" in
+      claude|pi)
+        if [[ "$token" == "--resume" || "$token" == "-r" || "$token" == "--session" || "$token" == "--session-id" ]]; then
+          [[ "$next" =~ $UUID_RE ]] && { printf '%s\n' "$next"; return 0; }
+        elif [[ "$token" == --resume=* ]]; then
+          next="${token#--resume=}"
+          [[ "$next" =~ $UUID_RE ]] && { printf '%s\n' "$next"; return 0; }
+        elif [[ "$token" == --session=* ]]; then
+          next="${token#--session=}"
+          [[ "$next" =~ $UUID_RE ]] && { printf '%s\n' "$next"; return 0; }
+        fi
+        ;;
+      codex)
+        if [[ "$token" == "resume" ]]; then
+          [[ "$next" =~ $UUID_RE ]] && { printf '%s\n' "$next"; return 0; }
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+
+claude_project_dir() {
+  local cwd="$1" key
+  key="$(printf '%s' "$cwd" | sed 's/[^[:alnum:]]/-/g')"
+  printf '%s/.claude/projects/%s' "$HOME" "$key"
+}
+
+find_claude_session_file() {
+  local id="$1" file
+  [[ -d "$HOME/.claude/projects" ]] || return 1
+  while IFS= read -r -d '' file; do printf '%s\n' "$file"; return 0; done \
+    < <(find "$HOME/.claude/projects" -type f -name "$id.jsonl" ! -path '*/subagents/*' -print0 2>/dev/null)
+  return 1
+}
+
+find_codex_session_file() {
+  local id="$1" file
+  [[ -d "$HOME/.codex/sessions" ]] || return 1
+  while IFS= read -r -d '' file; do printf '%s\n' "$file"; return 0; done \
+    < <(find "$HOME/.codex/sessions" -type f -name "*-$id.jsonl" -print0 2>/dev/null)
+  return 1
+}
+
+# Tier 2 (claude): the terminal title is the session's own summary line, so a
+# unique grep hit across that project's transcripts identifies the session.
+# Ambiguity is a failure, not a coin flip -- a wrong resume is worse than none.
+match_claude_by_title() {
+  local cwd="$1" title="$2" dir needle file
+  local -a matches=()
+  dir="$(claude_project_dir "$cwd")"
+  [[ -d "$dir" ]] || return 1
+  needle="$title"
+  # Strip a leading status glyph such as the spinner herdr shows while working.
+  [[ "$needle" =~ ^[^[:alnum:]]+[[:space:]]+(.*)$ ]] && needle="${BASH_REMATCH[1]}"
+  ((${#needle} >= 12)) || return 1
+  while IFS= read -r -d '' file; do
+    grep -F -q -- "$needle" "$file" 2>/dev/null && matches+=("$file")
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+  ((${#matches[@]} == 1)) || return 1
+  MATCHED_FILE="${matches[0]}"
+  MATCHED_ID="${MATCHED_FILE##*/}"; MATCHED_ID="${MATCHED_ID%.jsonl}"
+  [[ "$MATCHED_ID" =~ $UUID_RE ]]
+}
+
+# Tier 2 (codex): codex tags its own log rows with the owning pid, which is an
+# exact join rather than a heuristic.
+match_codex_by_process_log() {
+  local root_pid="$1" db="$HOME/.codex/logs_2.sqlite" pid child thread_id file
+  local -a queue=("$root_pid") matches=()
+  have sqlite3 || return 1
+  [[ -f "$db" ]] || return 1
+  while ((${#queue[@]})); do
+    pid="${queue[0]}"; queue=("${queue[@]:1}")
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      thread_id="$(sqlite3 "$db" "SELECT thread_id FROM logs WHERE process_uuid LIKE 'pid:$pid:%' AND thread_id IS NOT NULL GROUP BY thread_id ORDER BY MIN(ts), thread_id LIMIT 1;" 2>/dev/null)" || true
+      if [[ "$thread_id" =~ $UUID_RE ]]; then
+        file="$(find_codex_session_file "$thread_id" 2>/dev/null || true)"
+        [[ -n "$file" ]] && matches+=("$thread_id"$'\t'"$file")
+      fi
+    fi
+    while IFS= read -r child; do
+      [[ -n "$child" && -d "/proc/$child" ]] && queue+=("$child")
+    done < <(proc_children "$pid")
+  done
+  ((${#matches[@]} == 1)) || return 1
+  IFS=$'\t' read -r MATCHED_ID MATCHED_FILE <<<"${matches[0]}"
+}
+
+# Tier 3 (codex): line up the process start time with a rollout header written
+# in the same cwd. Only accepted when exactly one candidate lands inside the
+# window, so two agents started together never cross-resume.
+match_codex_by_launch() {
+  local pid="$1" cwd="$2" elapsed start day file first meta id ts fcwd cand diff offset
+  local best_diff=999999999 best_id="" best_file="" ties=0
+  have jq || return 1
+  elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$elapsed" =~ ^[0-9]+$ ]] || return 1
+  start=$(( $(date +%s) - elapsed ))
+  for offset in -1 0 1; do
+    day="$HOME/.codex/sessions/$(date -d "@$((start + offset * 86400))" +%Y/%m/%d)"
+    [[ -d "$day" ]] || continue
+    while IFS= read -r -d '' file; do
+      IFS= read -r first < "$file" || continue
+      meta="$(jq -r 'select(.type == "session_meta") | [.payload.id, .payload.timestamp, .payload.cwd] | @tsv' <<<"$first" 2>/dev/null)" || continue
+      [[ -n "$meta" ]] || continue
+      IFS=$'\t' read -r id ts fcwd <<<"$meta"
+      [[ "$id" =~ $UUID_RE && "$fcwd" == "$cwd" ]] || continue
+      cand="$(date -d "$ts" +%s 2>/dev/null)" || continue
+      diff=$((cand - start)); ((diff < 0)) && diff=$((-diff))
+      if ((diff < best_diff)); then best_diff=$diff; best_id="$id"; best_file="$file"; ties=1
+      elif ((diff == best_diff)); then ties=$((ties + 1)); fi
+    done < <(find "$day" -maxdepth 1 -type f -name 'rollout-*.jsonl' -print0 2>/dev/null)
+  done
+  ((best_diff <= 300 && ties == 1)) || return 1
+  MATCHED_ID="$best_id"; MATCHED_FILE="$best_file"
+}
+
+# Resolve everything we can about the agent living under a pane, and be honest
+# about which method got us there. Sets AGENT_* for the caller.
+identify_agent() {
+  local pane_pid="$1" cwd="$2" title="$3" id file
+  AGENT_KIND=""; AGENT_PID=""; AGENT_SESSION_ID=""; AGENT_METHOD=""; AGENT_SESSION_FILE=""
+  discover_agent "$pane_pid" || return 1
+
+  if id="$(explicit_resume_id "$AGENT_KIND" "$AGENT_PID" 2>/dev/null)"; then
+    AGENT_SESSION_ID="$id"; AGENT_METHOD="argv"
+    case "$AGENT_KIND" in
+      claude) AGENT_SESSION_FILE="$(find_claude_session_file "$id" 2>/dev/null || true)" ;;
+      codex)  AGENT_SESSION_FILE="$(find_codex_session_file "$id" 2>/dev/null || true)" ;;
+    esac
+    return 0
+  fi
+
+  MATCHED_ID=""; MATCHED_FILE=""
+  if [[ "$AGENT_KIND" == "claude" ]] && match_claude_by_title "$cwd" "$title"; then
+    AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="pane-title"; AGENT_SESSION_FILE="$MATCHED_FILE"
+  elif [[ "$AGENT_KIND" == "codex" ]] && match_codex_by_process_log "$AGENT_PID"; then
+    AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="process-log"; AGENT_SESSION_FILE="$MATCHED_FILE"
+  elif [[ "$AGENT_KIND" == "codex" ]] && match_codex_by_launch "$AGENT_PID" "$cwd"; then
+    AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="launch-time"; AGENT_SESSION_FILE="$MATCHED_FILE"
+  elif agent_supports_continue "$AGENT_KIND" && agent_has_history "$AGENT_KIND" "$cwd"; then
+    # No id we would stake a resume on, but the CLI can reopen the most recent
+    # conversation for this directory on its own. Weaker, and labelled as such.
+    AGENT_METHOD="continue"
+  else
+    AGENT_METHOD="unmatched"
+  fi
+  return 0
+}
+
+agent_supports_continue() {
+  case "$1" in claude|pi|opencode|crush) return 0 ;; *) return 1 ;; esac
+}
+
+# Only offer --continue where there is actually a prior conversation for this
+# directory; otherwise the flag opens an empty session and looks like a bug.
+agent_has_history() {
+  local kind="$1" cwd="$2" dir
+  case "$kind" in
+    claude)
+      dir="$(claude_project_dir "$cwd")"
+      [[ -d "$dir" ]] && [[ -n "$(find "$dir" -maxdepth 1 -name '*.jsonl' -print -quit 2>/dev/null)" ]]
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+agent_session_alive() {
+  local kind="$1" id="$2" saved="$3"
+  [[ -n "$saved" && -f "$saved" ]] && return 0
+  case "$kind" in
+    claude) find_claude_session_file "$id" >/dev/null 2>&1 ;;
+    codex)  find_codex_session_file  "$id" >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+
+# The command line that reopens a captured agent, or empty when we refuse to.
+agent_resume_command() {
+  local kind="$1" id="$2" method="$3" exe
+  exe="$(command -v "$kind" 2>/dev/null)" || return 1
+  [[ -n "$exe" ]] || return 1
+  if [[ "$method" == "continue" ]]; then
+    case "$kind" in
+      claude|pi)      printf '%q --continue' "$exe" ;;
+      opencode|crush) printf '%q --continue' "$exe" ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  [[ -n "$id" ]] || return 1
+  case "$kind" in
+    claude) printf '%q --resume %q' "$exe" "$id" ;;
+    codex)  printf '%q resume %q'   "$exe" "$id" ;;
+    pi)     printf '%q --session %q' "$exe" "$id" ;;
+    *) return 1 ;;
+  esac
+}

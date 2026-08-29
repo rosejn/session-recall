@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "session-recall",
+  "name": "Session Recall",
+  "version": "0.3.0",
+  "author": "rosejn",
+  "license": "MIT",
+  "description": "Automatically remembers your desktop \u2014 windows, workspaces, terminal working directories, and running coding-agent sessions \u2014 and brings it all back after a reboot.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Session Recall",
+    "description": "Save and restore named desktop setups: window layout, terminal cwds, and resumable Claude/Codex/pi sessions.",
+    "category": "Compositor",
+    "defaultSection": "right",
+    "aliases": [
+      "recall",
+      "session",
+      "layout"
+    ],
+    "allowMultiple": false
+  }
+}

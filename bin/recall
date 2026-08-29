@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# session-recall — automatic desktop session save and restore for Omarchy.
+set -Eeuo pipefail
+BIN="$(dirname "$(readlink -f "$0")")"
+source "$BIN/recall-lib"
+
+usage() {
+  cat <<'EOF'
+Save and restore your Omarchy desktop: window layout, terminal working
+directories, and resumable coding-agent sessions.
+
+Usage:
+  recall save [NAME]              Save a named setup (or a timestamp)
+  recall restore [NAME]           Restore a setup (default: the newest snapshot)
+  recall restore --dry-run        Show what a restore would do, change nothing
+  recall list [--json]            List saved setups and automatic snapshots
+  recall suggest-name             Suggest a setup name from the dominant git repo
+  recall status [NAME]            Show what a snapshot holds, agent by agent
+  recall delete NAME              Delete a saved setup
+  recall doctor                   Check what this machine can capture
+  recall prune                    Trim automatic snapshots to the keep limit
+
+Options for restore:
+  --no-agents           Restore windows and panes, start no agents
+  --include-uncertain   Also launch windows matched only by window class
+  --quiet               Suppress progress output
+
+Internal (used by the shell plugin):
+  recall auto-save      Take an automatic snapshot
+  recall boot-restore   Restore once per boot, if enabled
+
+State lives in ~/.local/state/omarchy-recall (0700 — snapshots hold scrollback).
+EOF
+}
+
+# Machine-readable listing for the bar widget, so the QML never has to walk
+# the snapshot tree itself.
+cmd_list_json() {
+  local d latest=""
+  [[ -L "$RECALL_STATE/latest" ]] && latest="$(readlink -f "$RECALL_STATE/latest")"
+  { [[ -d "$RECALL_SNAPS" ]] && find "$RECALL_SNAPS" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp*' -print | sort -r || true; } \
+  | while IFS= read -r d; do
+      [[ -f "$d/snapshot.json" ]] || continue
+      jq -c --arg dir "$d" --arg latest "$latest" '{
+        name, kind, createdAt, dir: $dir,
+        isLatest: ($dir == $latest),
+        windows: .counts.windows,
+        agents: .counts.agents,
+        agentsResumable: .counts.agentsResumable,
+        uncertain: .counts.uncertain
+      }' "$d/snapshot.json"
+    done | jq -sc '.'
+}
+
+# Name a setup after the work in it: the git repo most of the open terminals
+# are sitting in. Beats a timestamp nobody can tell apart later.
+cmd_suggest_name() {
+  local best
+  best="$(
+    { [[ -d "$RECALL_STATE/latest" ]] && jq -r '
+        ((.terminal.herdr.panes // []) | map(.cwd))
+        + ((.terminal.tmux.sessions // []) | map(.windows[].panes[].cwd))
+        | flatten | .[]? // empty' "$RECALL_STATE/latest/snapshot.json" 2>/dev/null || true; } \
+    | while IFS= read -r c; do
+        [[ -d "$c" ]] || continue
+        git -C "$c" rev-parse --show-toplevel 2>/dev/null || true
+      done | sort | uniq -c | sort -rn | head -1 | awk '{$1=""; sub(/^ /,""); print}'
+  )"
+  if [[ -n "$best" ]]; then basename "$best"; else date +%Y%m%d-%H%M%S; fi
+}
+
+cmd_list() {
+  local latest="" d name kind created counts
+  [[ -d "$RECALL_SNAPS" ]] || { echo "No snapshots yet."; return 0; }
+  [[ -L "$RECALL_STATE/latest" ]] && latest="$(readlink -f "$RECALL_STATE/latest")"
+  printf '%-26s %-7s %-20s %s\n' NAME KIND CREATED CONTENTS
+  while IFS= read -r d; do
+    [[ -f "$d/snapshot.json" ]] || continue
+    name="$(jq -r '.name' "$d/snapshot.json")"
+    kind="$(jq -r '.kind' "$d/snapshot.json")"
+    created="$(jq -r '.createdAt' "$d/snapshot.json" | cut -c1-19)"
+    counts="$(jq -r '"\(.counts.windows) windows, \(.counts.agents) agents (\(.counts.agentsResumable) resumable)"' "$d/snapshot.json")"
+    printf '%-26s %-7s %-20s %s%s\n' "$name" "$kind" "$created" "$counts" \
+      "$([[ "$(readlink -f "$d")" == "$latest" ]] && printf '  <- latest')"
+  done < <(find "$RECALL_SNAPS" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp*' -print | sort -r)
+}
+
+cmd_status() {
+  local want="${1:-latest}" d
+  case "$want" in
+    latest) d="$RECALL_STATE/latest" ;;
+    last-auto) d="$RECALL_STATE/last-auto" ;;
+    */*) d="$want" ;;
+    *) d="$RECALL_SNAPS/$want" ;;
+  esac
+  [[ -f "$d/snapshot.json" ]] || die "snapshot not found: $want"
+  jq -r '
+    "Snapshot: \(.name)  (\(.kind))",
+    "Created:  \(.createdAt) on \(.hostname)",
+    "Monitors: \(.monitorTopology)",
+    "",
+    "WINDOWS",
+    (.windows[] | "  [\(.launch.tier | (. + "        ")[0:7])] ws\(.workspace.id)  \(.class)\n            \(.launch.command // ((.launch.argv // []) | join(" ")) | .[0:96])"),
+    "",
+    "AGENTS"
+  ' "$d/snapshot.json"
+  jq -r '
+    ((.terminal.herdr.panes // []) | map({loc: .pane_id} + .))
+    + ((.terminal.tmux.sessions // []) | map(.name as $s | .windows[] | .index as $w
+        | .panes[] | {loc: ($s + ":" + ($w|tostring) + "." + (.index|tostring))} + .))
+    | map(select((.agentKind // "") != ""))
+    | if length == 0 then "  (none captured)" else
+        (.[] | "  \(.loc)  \(.agentKind)  via \(.agentMethod)  \(.agentSessionId // "-")\n        \(.cwd)")
+      end' "$d/snapshot.json"
+}
+
+cmd_delete() {
+  local name="${1:?usage: recall delete NAME}" d="$RECALL_SNAPS/$1"
+  [[ -d "$d" ]] || die "snapshot not found: $name"
+  rm -rf -- "$d"
+  echo "Deleted $name"
+}
+
+cmd_prune() {
+  local keep d n=0
+  keep="$(config_get keepAutoSnapshots 20)"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=20
+  [[ -d "$RECALL_SNAPS" ]] || return 0
+  while IFS= read -r d; do
+    n=$((n + 1))
+    # `((...))` yields exit status 1 when the test is false, which would become
+    # this function's return status on the last loop pass and fail the caller.
+    if ((n > keep)); then rm -rf -- "$d"; fi
+  done < <(find "$RECALL_SNAPS" -mindepth 1 -maxdepth 1 -type d -name 'auto-*' -print | sort -r)
+  return 0
+}
+
+cmd_doctor() {
+  local c ok=0
+  echo "session-recall $RECALL_VERSION"
+  echo
+  echo "Required:"
+  for c in jq hyprctl bash find grep date; do
+    if have "$c"; then printf '  ok       %-10s %s\n' "$c" "$(command -v "$c")"
+    else printf '  MISSING  %s\n' "$c"; ok=1; fi
+  done
+  echo
+  echo "Terminal backends (all optional — detected, never required):"
+  if have herdr; then
+    if timeout 5 herdr api snapshot >/dev/null 2>&1; then
+      printf '  ok       herdr      server answering, protocol %s\n' \
+        "$(timeout 5 herdr api snapshot | jq -r '.result.snapshot.protocol')"
+    else printf '  idle     herdr      installed, server not running\n'; fi
+  else printf '  absent   herdr\n'; fi
+  if have tmux; then
+    if tmux list-sessions >/dev/null 2>&1; then
+      printf '  ok       tmux       %s session(s)\n' "$(tmux list-sessions 2>/dev/null | wc -l)"
+    else printf '  idle     tmux       installed, no server running\n'; fi
+  else printf '  absent   tmux\n'; fi
+  echo
+  echo "Agents (resume support):"
+  for c in $RECALL_AGENT_KINDS; do
+    have "$c" && printf '  ok       %-10s %s\n' "$c" "$(command -v "$c")"
+  done
+  echo
+  printf '  sqlite3  %s  (improves codex session matching)\n' \
+    "$(have sqlite3 && echo present || echo absent)"
+  echo
+  echo "State:    $RECALL_STATE"
+  echo "Autosave: $(config_get autoSave true)   Auto-restore: $(config_get autoRestore true)"
+  return $ok
+}
+
+cmd_boot_restore() {
+  # Restore exactly once per boot. The boot id changes on every cold start, so
+  # comparing it is more honest than a timestamp and survives shell restarts,
+  # which must never trigger a second restore.
+  local boot_id marker
+  [[ "$(config_get autoRestore true)" == "true" ]] || { echo "auto-restore disabled"; return 0; }
+  boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+  marker="$RECALL_STATE/last-boot-id"
+  mkdir -p "$RECALL_STATE"
+  if [[ -f "$marker" && "$(<"$marker")" == "$boot_id" ]]; then
+    echo "already restored for this boot"; return 0
+  fi
+  printf '%s' "$boot_id" > "$marker"
+  [[ -d "$RECALL_STATE/last-auto" ]] || { echo "no automatic snapshot to restore"; return 0; }
+  exec "$BIN/recall-restore" last-auto --quiet
+}
+
+case "${1:-help}" in
+  save)          shift; "$BIN/recall-capture" ${1:+--label "$1"} ;;
+  auto-save)     shift; "$BIN/recall-capture" --auto >/dev/null && "$0" prune ;;
+  restore|load)  shift; "$BIN/recall-restore" "$@" ;;
+  boot-restore)  shift; cmd_boot_restore ;;
+  list)          shift; if [[ "${1:-}" == "--json" ]]; then cmd_list_json; else cmd_list; fi ;;
+  suggest-name)  shift; cmd_suggest_name ;;
+  status|show)   shift; cmd_status "$@" ;;
+  delete|rm)     shift; cmd_delete "$@" ;;
+  prune)         shift; cmd_prune ;;
+  doctor)        shift; cmd_doctor ;;
+  config)        shift; [[ $# -eq 2 ]] && config_set "$1" "$2" || config_get "${1:?}" "" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command: $1 (try: recall help)" ;;
+esac
