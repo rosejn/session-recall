@@ -3,6 +3,7 @@
 # than recreating blindly, so restoring twice is a no-op instead of a mess.
 set -Eeuo pipefail
 source "$(dirname "$(readlink -f "$0")")/recall-lib"
+source "$(dirname "$(readlink -f "$0")")/recall-handlers"
 
 SNAP_ARG="latest"; DRY=0; WITH_AGENTS=1; INCLUDE_UNCERTAIN=0; QUIET=0; WITH_GEOMETRY=1
 STAGGER="${RECALL_STAGGER:-0.35}"
@@ -147,7 +148,10 @@ place_pending() {
 
 SNAP="$(resolve_snapshot "$SNAP_ARG")"
 J="$SNAP/snapshot.json"
-say() { ((QUIET)) || printf '%s\n' "$*"; }
+log_section "restore $(basename "$SNAP")$( ((DRY)) && printf ' (dry run)')"
+# Everything the restore reports goes to the log as well as the terminal, so a
+# --quiet boot restore is still fully accounted for afterwards.
+say() { ((QUIET)) || printf '%s\n' "$*"; logmsg "$*"; }
 run() { if ((DRY)); then printf '  would run: %s\n' "$*"; else eval "$@"; fi; }
 
 saved_topology="$(jq -r '.monitorTopology' "$J")"
@@ -159,6 +163,8 @@ fi
 LIVE="$(hyprctl -j clients)"
 CLAIMED="$(jq -c '[ .[].address ]' <<<"$LIVE")"
 PENDING=()
+# Classes already started by a singleton handler this run.
+SINGLETON_STARTED=""
 WINS="$(jq -c '.windows' "$J")"
 # Saved geometry paired with the address the window actually came back as.
 # Nothing can be sized until every window has arrived, because a tiled window's
@@ -201,13 +207,31 @@ while IFS= read -r w; do
     continue
   fi
 
+  # An app handler outranks every generic recipe: it was written precisely
+  # because the generic one gets this app wrong. It also rescues an app that
+  # would otherwise be parked as an uncertain class-only guess.
+  handler_cmd=""; handler_name=""
+  if handler_path="$(app_handler_for "$class" 2>/dev/null)" && [[ -n "$handler_path" ]]; then
+    handler_name="$(basename "$handler_path" .sh)"
+    handler_cmd="$(app_hook_command "$handler_path" "$w" 2>/dev/null || true)"
+  fi
+  if [[ -n "$handler_cmd" ]]; then
+    cmd="$handler_cmd"
+    tier="handler:$handler_name"
+  else
   case "$tier" in
     exact)
       # argv is already the exact process that was running; rebuild it verbatim
       # so flags like foot's --working-directory survive.
-      mapfile -t argv < <(jq -r '.launch.argv[]?' <<<"$w")
-      ((${#argv[@]})) || { skipped=$((skipped + 1)); continue; }
-      printf -v cmd '%q ' "${argv[@]}"; cmd="${cmd% }"
+      if [[ "$(jq -r '.launch.argvBlob // false' <<<"$w")" == "true" ]]; then
+        # Already a whole command line -- quoting it again would break it.
+        cmd="$(jq -r '.launch.argv[0] // ""' <<<"$w")"
+      else
+        mapfile -t argv < <(jq -r '.launch.argv[]?' <<<"$w")
+        ((${#argv[@]})) || { skipped=$((skipped + 1)); continue; }
+        printf -v cmd '%q ' "${argv[@]}"; cmd="${cmd% }"
+      fi
+      [[ -n "$cmd" ]] || { skipped=$((skipped + 1)); continue; }
       ;;
     webapp|known) ;;   # command already carries the URL / desktop launcher
     guess)
@@ -223,21 +247,62 @@ while IFS= read -r w; do
       continue
       ;;
   esac
+  fi
 
   [[ -n "$cmd" ]] || { skipped=$((skipped + 1)); continue; }
+  # A singleton app is launched once; its own session restore produces the
+  # rest. Still queue every saved window for placement, so each one that the
+  # app brings back lands on the workspace it was saved on.
+  singleton_skip=0
+  if [[ -n "$handler_path" ]] && handler_is_singleton "$handler_path"; then
+    if grep -qxF "$class" <<<"$SINGLETON_STARTED"; then
+      singleton_skip=1
+    else
+      SINGLETON_STARTED+="${SINGLETON_STARTED:+$'\n'}$class"
+    fi
+  fi
+
   if ((DRY)); then
-    printf '  would launch: %s  (workspace %s, cwd %s)\n' "$cmd" "$ws" "${cwd:-none}"
+    if ((singleton_skip)); then
+      printf '  would place (restored by %s itself): %s\n' "$handler_name" "$class"
+    else
+      printf '  would launch: %s  (workspace %s, cwd %s)\n' "$cmd" "$ws" "${cwd:-none}"
+    fi
   else
-    launch_app "$cmd" "$cwd"
+    ((singleton_skip)) || launch_app "$cmd" "$cwd"
     PENDING+=("$class"$'\t'"$ws"$'\t'"$idx")
     # Place anything that has already mapped, so quick apps reach their
     # workspace while the slow ones are still starting.
     place_pending || true
   fi
-  launched=$((launched + 1))
-  say "  launch  $class -> workspace $ws  [$tier]"
+  if ((singleton_skip)); then
+    say "  window  $class -> workspace $ws  (restored by $handler_name itself)"
+  else
+    launched=$((launched + 1))
+    say "  launch  $class -> workspace $ws  [$tier]"
+  fi
+  logmsg "          $(jq -r '.launch.handlerNote // "no coverage note"' <<<"$w")"
   ((DRY)) || sleep "$STAGGER"
-done < <(jq -c '.windows | to_entries[] | { idx: .key } + .value' "$J")
+done < <(
+  # Launch order is load-bearing for anything whose first process wins: a
+  # browser only honours --restore-last-session when it is the instance that
+  # starts the browser, so its main window has to precede its web apps.
+  # Handlers declare `# recall:priority=N`; lower goes first.
+  jq -c '.windows | to_entries[] | { idx: .key } + .value' "$J" \
+  | while IFS= read -r wj; do
+      wclass="$(jq -r '.class' <<<"$wj")"
+      wtier="$(jq -r '.launch.tier' <<<"$wj")"
+      wprio=50
+      if wh="$(app_handler_for "$wclass" 2>/dev/null)" && [[ -n "$wh" ]]; then
+        wp="$(handler_meta "$wh" priority)"
+        [[ "$wp" =~ ^[0-9]+$ ]] && wprio="$wp"
+      elif [[ "$wtier" == "webapp" ]]; then
+        # Web apps ride inside a browser someone else may need to start first.
+        wprio=60
+      fi
+      printf '%s\t%s\n' "$wprio" "$wj"
+    done | sort -n -k1,1 -s | cut -f2-
+)
 
 # Sweep for late arrivals. Leaving a cold-booted browser on whatever workspace
 # happened to be focused is exactly the mess this plugin exists to prevent.
@@ -336,11 +401,29 @@ if ((WITH_AGENTS)) && [[ "$(jq -r '.terminal.herdr.available' "$J")" == "true" ]
       sfile="$(jq -r '.agentSessionFile // ""' <<<"$p")"
       [[ -n "$kind" ]] || continue
 
-      if [[ "$method" != "continue" ]] && ! agent_session_alive "$kind" "$sid" "$sfile"; then
-        say "  agent   $pane: $kind session $sid is gone; leaving a shell"
+      if [[ "$method" != "continue" && -z "$sid" ]]; then
+        # We saw the agent but never identified which conversation it was in.
+        # Guessing is worse than a clean prompt.
+        say "  agent   $pane: $kind was running but no session id was verified; leaving a shell"
         continue
       fi
-      resume="$(agent_resume_command "$kind" "$sid" "$method" || true)"
+      if [[ "$method" != "continue" ]] && ! agent_session_alive "$kind" "$sid" "$sfile"; then
+        say "  agent   $pane: $kind session $sid no longer exists on disk; leaving a shell"
+        continue
+      fi
+      # An agent handler knows how its CLI spells "reopen this conversation"
+      # and where that CLI records directory trust. Without one we can still
+      # fall back to the core's generic flags.
+      resume=""; agent_via="core"
+      if agent_path="$(agent_handler_for "$kind" 2>/dev/null)" && [[ -n "$agent_path" ]]; then
+        agent_via="agents/$(basename "$agent_path")"
+        pane_cwd="$(jq -r '.cwd // ""' <<<"$p")"
+        # Trust first: a resume that lands on a trust prompt has not resumed.
+        agent_hook_trust "$agent_path" "$pane_cwd" >/dev/null 2>&1 \
+          || say "  agent   $pane: could not pre-trust $pane_cwd for $kind"
+        resume="$(agent_hook_resume_command "$agent_path" "$pane_cwd" "$sid" "$method" 2>/dev/null || true)"
+      fi
+      [[ -n "$resume" ]] || resume="$(agent_resume_command "$kind" "$sid" "$method" || true)"
       [[ -n "$resume" ]] || { say "  agent   $pane: cannot rebuild a $kind resume; leaving a shell"; continue; }
 
       # A pane that is missing means herdr's own layout restore did not put it
@@ -360,7 +443,7 @@ if ((WITH_AGENTS)) && [[ "$(jq -r '.terminal.herdr.available' "$J")" == "true" ]
       # `pane run` sends the text and the Enter in one call, so a resume can
       # never be left half-typed at the prompt.
       run "timeout 10 herdr pane run $(printf '%q' "$pane") $(printf '%q' "$resume") >/dev/null"
-      say "  agent   $pane: $kind ($method${sid:+ $sid})"
+      say "  agent   $pane: $kind via $agent_via ($method${sid:+ $sid})"
     done < <(jq -c '.terminal.herdr.panes[]? | select((.agentKind // "") != "")' "$J")
   fi
 fi

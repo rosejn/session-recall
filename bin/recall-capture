@@ -2,6 +2,7 @@
 # Build one snapshot of the current desktop. Prints the snapshot directory.
 set -Eeuo pipefail
 source "$(dirname "$(readlink -f "$0")")/recall-lib"
+source "$(dirname "$(readlink -f "$0")")/recall-handlers"
 
 LABEL=""; KIND="named"; SCROLLBACK="${RECALL_SCROLLBACK:-2000}"
 while (($#)); do
@@ -103,7 +104,7 @@ while IFS= read -r client; do
   pid="$(jq -r   '.pid // 0' <<<"$client")"
   title="$(jq -r '.title // ""' <<<"$client")"
 
-  tier="none"; cmd=""; cwd=""; argv_json="null"; reason=""
+  tier="none"; cmd=""; cwd=""; argv_json="null"; reason=""; argv_blob=false
 
   hostpath="$(decode_webapp_class "$class" 2>/dev/null || true)"
   if [[ -n "$hostpath" && -n "${WEBAPP_BY_HOSTPATH[$hostpath]:-}" ]]; then
@@ -112,7 +113,13 @@ while IFS= read -r client; do
   elif [[ "$pid" != "0" && "${PID_WINDOWS[$pid]:-0}" -eq 1 ]] && argv_json="$(proc_argv_json "$pid")" && [[ "$argv_json" != "[]" ]]; then
     tier="exact"
     cwd="$(proc_cwd "$pid" 2>/dev/null || true)"
-    reason="sole window of pid $pid; argv and cwd read from /proc"
+    if proc_argv_is_blob "$pid"; then
+      argv_blob=true
+      reason="sole window of pid $pid; cmdline is one rewritten blob, kept as a command string"
+    else
+      argv_blob=false
+      reason="sole window of pid $pid; argv and cwd read from /proc"
+    fi
   else
     argv_json="null"
     if desk="$(desktop_for_class "$class" 2>/dev/null)"; then
@@ -129,10 +136,18 @@ while IFS= read -r client; do
     fi
   fi
 
+  handler=""; handler_note=""
+  if handler_path="$(app_handler_for "$class" 2>/dev/null)" && [[ -n "$handler_path" ]]; then
+    handler="$(basename "$handler_path" .sh)"
+  fi
+  handler_note="$(handler_coverage_note "$class" "$tier")"
+
   add_window "$(jq -nc \
     --argjson c "$client" \
+    --arg handler "$handler" --arg handlerNote "$handler_note" \
     --arg tier "$tier" --arg cmd "$cmd" --arg cwd "$cwd" \
     --arg reason "$reason" --argjson argv "${argv_json:-null}" \
+    --argjson argvBlob "$argv_blob" \
     --arg activeAddr "$ACTIVE_ADDR" '
     {
       address: $c.address, class: $c.class, initialClass: $c.initialClass,
@@ -141,7 +156,9 @@ while IFS= read -r client; do
       floating: $c.floating, fullscreen: $c.fullscreen, monitor: $c.monitor,
       pinned: $c.pinned, xwayland: $c.xwayland,
       focused: ($c.address == $activeAddr),
-      launch: { tier: $tier, command: $cmd, cwd: $cwd, argv: $argv, reason: $reason }
+      launch: { tier: $tier, command: $cmd, cwd: $cwd, argv: $argv,
+                argvBlob: $argvBlob, reason: $reason,
+                handler: $handler, handlerNote: $handlerNote }
     }')"
 done < <(jq -c --argjson ig "$IGNORE" '.[] | select(.class as $c | $ig | index($c) == null)' <<<"$CLIENTS")
 
@@ -248,5 +265,20 @@ trap - EXIT
 mkdir -p "$RECALL_STATE"
 ln -sfn "$DEST" "$RECALL_STATE/.latest.$$" && mv -Tf "$RECALL_STATE/.latest.$$" "$RECALL_STATE/latest"
 [[ "$KIND" == "auto" ]] && { ln -sfn "$DEST" "$RECALL_STATE/.lastauto.$$" && mv -Tf "$RECALL_STATE/.lastauto.$$" "$RECALL_STATE/last-auto"; }
+
+log_section "save $NAME ($KIND)"
+jq -r '
+  "  \(.counts.windows) windows: \(.counts.restorable) restorable, \(.counts.uncertain) uncertain, \(.counts.unknown) unknown",
+  "  \(.counts.agents) agents, \(.counts.agentsResumable) resumable",
+  (.windows[] | "  \(.class)  [\(.launch.tier)]  \(.launch.handlerNote)")
+' "$DEST/snapshot.json" 2>/dev/null | while IFS= read -r l; do logmsg "$l"; done
+
+# Say plainly which apps nobody has taught us about yet. This is the line that
+# turns "my app came back wrong" into "I could write apps/<name>.sh".
+missing="$(jq -r '[ .windows[] | select((.launch.handler // "") == "")
+                    | select(.launch.tier != "webapp") | .class ] | unique | join(", ")' \
+           "$DEST/snapshot.json" 2>/dev/null)"
+[[ -n "$missing" && "$missing" != "null" ]] && \
+  logmsg "  no app handler for: $missing  (add apps/<name>.sh to teach Session Recall about them)"
 
 printf '%s\n' "$DEST"

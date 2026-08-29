@@ -18,6 +18,7 @@ Usage:
   recall status [NAME]            Show what a snapshot holds, agent by agent
   recall delete NAME              Delete a saved setup
   recall doctor                   Check what this machine can capture
+  recall logs [-n N] [-f]         Show the save/restore log
   recall prune                    Trim automatic snapshots to the keep limit
 
 Options for restore:
@@ -138,6 +139,20 @@ cmd_prune() {
   return 0
 }
 
+cmd_logs() {
+  local n=200 follow=0
+  while (($#)); do
+    case "$1" in
+      -n) n="${2:?}"; shift 2 ;;
+      -f|--follow) follow=1; shift ;;
+      *) die "unknown logs option: $1" ;;
+    esac
+  done
+  log_open
+  [[ -f "$RECALL_LOG" ]] || { echo "No log yet. It is written on the next save or restore."; return 0; }
+  if ((follow)); then tail -n "$n" -f "$RECALL_LOG"; else tail -n "$n" "$RECALL_LOG"; fi
+}
+
 cmd_doctor() {
   local c ok=0
   echo "session-recall $RECALL_VERSION"
@@ -202,6 +217,7 @@ case "${1:-help}" in
   delete|rm)     shift; cmd_delete "$@" ;;
   prune)         shift; cmd_prune ;;
   doctor)        shift; cmd_doctor ;;
+  logs|log)      shift; cmd_logs "$@" ;;
   config)        shift; [[ $# -eq 2 ]] && config_set "$1" "$2" || config_get "${1:?}" "" ;;
   help|-h|--help) usage ;;
   *) die "unknown command: $1 (try: recall help)" ;;

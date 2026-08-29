@@ -76,6 +76,35 @@ self_restoring_json() {
   jq -cn --argjson d "$RECALL_SELF_RESTORING_DEFAULT" '$d | unique'
 }
 
+# ------------------------------------------------------------------- logging
+# Save and restore both run unattended, so without a log the only evidence that
+# something went wrong is a missing window. The log is also where an app with
+# no handler gets named, so a gap is something a user can see and fill rather
+# than a silent shrug.
+RECALL_LOG="$RECALL_STATE/logs/recall.log"
+RECALL_LOG_MAX=$((1024 * 1024))
+
+log_open() {
+  mkdir -p "$(dirname "$RECALL_LOG")" 2>/dev/null || return 0
+  # Keep one previous log; a restore that goes wrong is usually diagnosed from
+  # the run before it, not from six months of history.
+  if [[ -f "$RECALL_LOG" ]] && (( $(stat -c%s "$RECALL_LOG" 2>/dev/null || echo 0) > RECALL_LOG_MAX )); then
+    mv -f "$RECALL_LOG" "$RECALL_LOG.1" 2>/dev/null || true
+  fi
+}
+
+logmsg() {
+  log_open
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RECALL_LOG" 2>/dev/null || true
+}
+
+log_section() {
+  log_open
+  { printf '\n'
+    printf '=== %s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+  } >> "$RECALL_LOG" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------- /proc reads
 
 proc_argv_json() {
@@ -85,6 +114,22 @@ proc_argv_json() {
   # tail element that would become a bogus empty argv entry.
   tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
     | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || return 1
+}
+
+# Electron, Chromium and friends rewrite their own argv into one space-joined
+# blob, so /proc hands back a single "argument" that is really a whole command
+# line. Shell-quoting that as one word makes exec look for a file literally
+# named "slack --gtk-version=3 -s"; splitting it on spaces would corrupt any
+# argument that legitimately contains one. So flag it, and let the restore
+# treat it as a command string instead of an argv vector.
+proc_argv_is_blob() {
+  local pid="$1" nuls total
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  total="$(wc -c < "/proc/$pid/cmdline" 2>/dev/null || echo 0)"
+  (( total > 0 )) || return 1
+  nuls="$(tr -dc '\0' < "/proc/$pid/cmdline" 2>/dev/null | wc -c)"
+  # One NUL is just the terminator. More than one means real argv separators.
+  (( nuls <= 1 )) && grep -q ' ' < <(tr '\0' ' ' < "/proc/$pid/cmdline")
 }
 
 proc_cwd() {

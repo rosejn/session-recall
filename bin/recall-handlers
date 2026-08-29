@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Per-app and per-agent handler dispatch. Sourced, never executed.
+#
+# The core knows how to read /proc, place windows and drive herdr. It does not
+# know that Slack rewrites its argv, that Spotify's desktop entry leaves a bare
+# --uri behind, or that Chromium needs a flag to reopen its tabs. Every such
+# fact lives in one small file under apps/ or agents/, so adding support for a
+# new app never means touching the engine.
+#
+#   apps/<name>.sh     a window: how to relaunch it, what extra state to keep
+#   agents/<name>.sh   a coding agent: how to trust a directory and resume it
+#
+# Handlers are sourced in a subshell, one at a time, so every file can use the
+# same function names without colliding.
+
+RECALL_ROOT="${RECALL_ROOT:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")}"
+RECALL_APPS_DIR="$RECALL_ROOT/apps"
+RECALL_AGENTS_DIR="$RECALL_ROOT/agents"
+
+# Read one `# recall:<key>=<value>` metadata line from a handler.
+handler_meta() {
+  sed -n "s/^# *recall:$2= *//p" "$1" 2>/dev/null | head -1
+}
+
+# The handler that claims this window class, if any. Patterns are globs so a
+# handler can claim a family such as chrome-* with one entry.
+app_handler_for() {
+  local class="$1" f pat
+  [[ -d "$RECALL_APPS_DIR" ]] || return 1
+  for f in "$RECALL_APPS_DIR"/*.sh; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r pat; do
+      [[ -n "$pat" ]] || continue
+      # shellcheck disable=SC2053 -- glob match is the point
+      if [[ "$class" == $pat ]]; then printf '%s' "$f"; return 0; fi
+    done < <(handler_meta "$f" classes | tr ',' '\n' | sed 's/^ *//; s/ *$//')
+  done
+  return 1
+}
+
+agent_handler_for() {
+  local kind="$1" f
+  [[ -d "$RECALL_AGENTS_DIR" ]] || return 1
+  for f in "$RECALL_AGENTS_DIR"/*.sh; do
+    [[ -f "$f" ]] || continue
+    [[ "$(handler_meta "$f" agent)" == "$kind" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# An app that restores its own windows must be started once, however many of
+# its windows were saved -- otherwise the session restore brings them all back
+# and each extra launch adds a spare on top.
+handler_is_singleton() {
+  [[ "$(handler_meta "$1" singleton)" == "true" ]]
+}
+
+# --- app hooks -------------------------------------------------------------
+# Each returns empty when the handler has no opinion, so the caller falls back
+# to the generic recipe rather than to nothing.
+
+# Extra JSON to fold into the window's record at capture time.
+app_hook_capture() {
+  local handler="$1" window="$2" pid="$3"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F app_capture >/dev/null || exit 1
+    app_capture "$window" "$pid" )
+}
+
+# The command line that relaunches this window.
+app_hook_command() {
+  local handler="$1" window="$2"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F app_command >/dev/null || exit 1
+    app_command "$window" )
+}
+
+# --- agent hooks -----------------------------------------------------------
+
+# Record the directory as trusted so a restored agent starts in its session
+# instead of on a "do you trust this folder?" prompt. Restoring a session the
+# user themselves created is not a new trust decision.
+agent_hook_trust() {
+  local handler="$1" cwd="$2"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F agent_trust >/dev/null || exit 0
+    agent_trust "$cwd" )
+}
+
+# The command that reopens a captured conversation.
+agent_hook_resume_command() {
+  local handler="$1" cwd="$2" id="$3" method="$4"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F agent_resume_command >/dev/null || exit 1
+    agent_resume_command "$cwd" "$id" "$method" )
+}
+
+# --- coverage --------------------------------------------------------------
+# Used by the log so an unhandled app is visible as a gap someone could fill,
+# rather than silently doing the generic thing.
+handler_coverage_note() {
+  local class="$1" tier="${2:-}" handler slug
+  if handler="$(app_handler_for "$class" 2>/dev/null)" && [[ -n "$handler" ]]; then
+    printf 'handled by apps/%s' "$(basename "$handler")"
+    return
+  fi
+  case "$tier" in
+    webapp)
+      printf 'web app; URL recovered from the window class, no handler needed' ;;
+    exact)
+      printf 'generic recipe from /proc argv; add apps/%s.sh if it comes back wrong' \
+        "$(handler_slug "$class")" ;;
+    known)
+      printf 'relaunched by desktop entry and restores itself; add apps/%s.sh to do better' \
+        "$(handler_slug "$class")" ;;
+    *)
+      printf 'no handler and no confident recipe; apps/%s.sh would fix this' \
+        "$(handler_slug "$class")" ;;
+  esac
+}
+
+# A filename-safe stem to suggest, so the note names a file someone can create.
+handler_slug() {
+  tr '[:upper:]' '[:lower:]' <<<"$1" | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//' | cut -c1-40
+}

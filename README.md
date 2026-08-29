@@ -75,6 +75,97 @@ dump. Expect the odd 1–2px difference where gaps round.
 Workspaces running Omarchy's `scrolling` layout build their own geometry and are
 left alone. `--no-geometry` skips the whole pass.
 
+## Adding support for an app
+
+No app-specific logic lives in the engine. Everything Session Recall knows about
+a particular program lives in one small file, so teaching it about a new app
+never means touching the core.
+
+```
+apps/<name>.sh      a window: how to relaunch it, and when
+agents/<name>.sh    a coding agent: how to trust a directory and resume it
+```
+
+Each file is plain bash, sourced in a subshell, so every handler can use the
+same function names without colliding.
+
+### An app handler
+
+```bash
+#!/usr/bin/env bash
+# recall:classes=Spotify,spotify        # window classes, globs allowed
+# recall:description=Spotify desktop client
+# recall:priority=10                    # optional; lower launches earlier (default 50)
+# recall:singleton=true                 # optional; launch once however many windows were saved
+
+# Print the command that relaunches this window. Print nothing (or return 1) to
+# let the generic /proc recipe handle it.
+app_command() {
+  local window="$1"       # the saved window as JSON
+  printf 'spotify'
+}
+
+# Optional. Print a JSON object to fold into the saved record.
+app_capture() { local window="$1" pid="$2"; }
+```
+
+A handler outranks every generic recipe, and also rescues an app that would
+otherwise be parked as an uncertain class-only guess.
+
+`priority` matters more than it looks. A browser only honours
+`--restore-last-session` in the process that *starts* the browser, so its main
+window has to be launched before any `--app=` web app window, or the flag
+arrives at a running instance and does nothing.
+
+`singleton` is for apps that restore their own windows: launch once, and let the
+app bring the rest back. Without it you get the app's restored session *plus* one
+spare window for every window after the first.
+
+### An agent handler
+
+```bash
+#!/usr/bin/env bash
+# recall:agent=codex
+
+# Record the directory as trusted, so a restored agent starts in its session
+# instead of on a "do you trust this folder?" prompt. Restoring a session the
+# user created is not a new trust decision.
+agent_trust() { local cwd="$1"; }
+
+# Print the command that reopens a captured conversation.
+agent_resume_command() {
+  local cwd="$1" id="$2" method="$3"   # method: argv | pane-title | process-log | launch-time | continue
+  printf '%q resume %q' "$(command -v codex)" "$id"
+}
+```
+
+### What ships today
+
+| Handler | What it knows |
+|---|---|
+| `apps/slack.sh` | Electron rewrites its argv into one blob, so use the desktop entry instead; strip `%U` and `-s` |
+| `apps/spotify.sh` | The running process carries a bare `--uri` left over from the desktop entry's `%u` |
+| `apps/chromium.sh` | Needs `--restore-last-session` or you get only pinned tabs; must start before its web apps; restores its own windows |
+| `agents/claude.sh` | Trust lives in `~/.claude.json`; resumes with `--resume <id>` or `--continue` |
+| `agents/codex.sh` | Trust lives in `~/.codex/config.toml`; resumes with `codex resume <id>`; has no `--continue` |
+
+Anything without a handler still gets the generic recipe. The log names those
+apps explicitly on every save, so a gap is something you can see and fill rather
+than a silent shrug — and the bar dropdown shows the count.
+
+## Logs
+
+Save and restore both run unattended, so the log is the whole story when a
+window does not come back.
+
+```
+recall logs            # last 200 lines
+recall logs -n 500 -f  # follow
+```
+
+The dropdown has a button for it, next to one for `recall doctor`. Every entry
+names the handler that ran, or says which app had none.
+
 ## Agents
 
 Terminal backends are detected, never required — herdr, tmux, or neither.

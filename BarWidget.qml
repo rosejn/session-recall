@@ -36,6 +36,7 @@ Panel {
   property bool busy: false
   property string statusLine: ""
   property string suggestedName: ""
+  property string coverageNote: ""
 
   readonly property var latest: snapshots.length > 0 ? snapshots[0] : null
 
@@ -49,6 +50,7 @@ Panel {
     if (!listProc.running) listProc.running = true
     if (!configProc.running) configProc.running = true
     if (!suggestProc.running) suggestProc.running = true
+    if (!coverageProc.running) coverageProc.running = true
   }
 
   function runRecall(args, thenRefresh) {
@@ -126,6 +128,25 @@ Panel {
           root.autoSave = c.autoSave !== false
           root.autoRestore = c.autoRestore !== false
         } catch (e) {}
+      }
+    }
+  }
+
+  // Names the apps with no handler, so the gap is visible where people look
+  // rather than only in the log.
+  Process {
+    id: coverageProc
+    command: ["bash", "-lc",
+      "jq -r '[ .windows[] | select((.launch.handler // \"\") == \"\")"
+      + " | select(.launch.tier != \"webapp\") | .class ] | unique | length' "
+      + root.q(root.home + "/.local/state/omarchy-recall/latest/snapshot.json") + " 2>/dev/null || echo 0"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var n = parseInt(String(text || "0").trim())
+        root.coverageNote = (isNaN(n) || n === 0)
+          ? "every app has a handler"
+          : n + (n === 1 ? " app has no handler yet" : " apps have no handler yet")
       }
     }
   }
@@ -307,6 +328,52 @@ Panel {
 
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
+          // The log is the whole debugging story for an unattended restore, and
+          // it names every app that has no handler yet -- which is how someone
+          // finds out there is a gap they could fill.
+          Row {
+            width: parent.width
+            spacing: Style.spacing.controlGap
+
+            PanelActionButton {
+              iconText: "󰈙"
+              tooltipText: "Open the save/restore log"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: {
+                root.close()
+                if (root.bar) root.bar.run(
+                  "omarchy-launch-or-focus-tui " + root.q(
+                    "bash -c " + root.q(root.q(root.recall) + " logs -n 500 | less -R +G")))
+              }
+            }
+
+            PanelActionButton {
+              iconText: "󰋽"
+              tooltipText: "What this machine can capture (recall doctor)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: {
+                root.close()
+                if (root.bar) root.bar.run(
+                  "omarchy-launch-or-focus-tui " + root.q(
+                    "bash -c " + root.q(root.q(root.recall) + " doctor; read -n 1")))
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.coverageNote
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+
           PanelSectionHeader {
             text: "SAVED SETUPS"
             foreground: root.foreground
@@ -323,13 +390,14 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+
           Column {
             id: rows
             width: parent.width
             spacing: Style.space(4)
 
             Repeater {
-              model: root.snapshots
+              model: root.snapshots.slice(0, 10)
               delegate: CursorSurface {
                 id: rowSurface
                 required property var modelData
