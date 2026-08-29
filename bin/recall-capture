@@ -35,6 +35,7 @@ WORKSPACES="$(hyprctl -j workspaces)"
 MONITORS="$(hyprctl -j monitors)"
 ACTIVE="$(hyprctl -j activewindow 2>/dev/null || echo '{}')"
 IGNORE="$(ignore_classes_json)"
+SELF_RESTORING="$(self_restoring_json)"
 
 # ------------------------------------------------------------------ web apps
 # Omarchy encodes a web app's URL into the Chromium window class
@@ -115,8 +116,14 @@ while IFS= read -r client; do
   else
     argv_json="null"
     if desk="$(desktop_for_class "$class" 2>/dev/null)"; then
-      tier="guess"; cmd="gtk-launch $desk"
-      reason="matched desktop entry $desk by window class"
+      cmd="gtk-launch $desk"
+      if jq -e --arg c "$class" --argjson sr "$SELF_RESTORING" '$sr | index($c) != null' >/dev/null <<<'null'; then
+        tier="known"
+        reason="matched desktop entry $desk; this app restores its own windows and tabs"
+      else
+        tier="guess"
+        reason="matched desktop entry $desk by window class"
+      fi
     else
       reason="no argv (pid shared or unreadable) and no desktop entry for class"
     fi
@@ -223,7 +230,7 @@ jq -n \
     terminal: { herdr: $herdr, tmux: $tmux },
     counts: {
       windows: ($windows | length),
-      restorable: ($windows | map(select(.launch.tier == "exact" or .launch.tier == "webapp")) | length),
+      restorable: ($windows | map(select(.launch.tier == "exact" or .launch.tier == "webapp" or .launch.tier == "known")) | length),
       uncertain: ($windows | map(select(.launch.tier == "guess")) | length),
       unknown: ($windows | map(select(.launch.tier == "none")) | length),
       agents: (($herdr.panes // []) + (($tmux.sessions // []) | map(.windows[].panes[]))

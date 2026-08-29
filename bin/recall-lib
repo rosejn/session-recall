@@ -57,6 +57,25 @@ ignore_classes_json() {
   jq -cn --argjson d "$RECALL_IGNORE_CLASSES_DEFAULT" '$d | unique'
 }
 
+# Apps whose own restore is better than ours. A browser shares one pid across
+# every window, so /proc can never give us exact argv for it -- but relaunching
+# it plainly brings back its tabs by itself, which is the outcome we wanted.
+# Matching one of these by window class is a good enough recipe to run
+# unattended, so it is promoted out of the "parked" tier.
+RECALL_SELF_RESTORING_DEFAULT='[
+  "chromium","google-chrome","google-chrome-stable","brave-browser","brave",
+  "firefox","firefox-esr","librewolf","zen","vivaldi-stable","microsoft-edge",
+  "Slack","slack","code","Code","codium","obsidian","logseq","spotify","Spotify"
+]'
+
+self_restoring_json() {
+  if [[ -f "$RECALL_CONFIG" ]]; then
+    jq -c --argjson d "$RECALL_SELF_RESTORING_DEFAULT" \
+      '(.selfRestoringClasses // []) + $d | unique' "$RECALL_CONFIG" 2>/dev/null && return
+  fi
+  jq -cn --argjson d "$RECALL_SELF_RESTORING_DEFAULT" '$d | unique'
+}
+
 # ---------------------------------------------------------------- /proc reads
 
 proc_argv_json() {

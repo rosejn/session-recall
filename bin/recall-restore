@@ -34,9 +34,36 @@ resolve_snapshot() {
   printf '%s' "$c"
 }
 
-# Hyprland 0.56 routes `hyprctl dispatch` through Lua (`hl.dsp.*`); the old
-# positional form is gone. Omarchy's own scripts keep a legacy fallback, so we
-# do too -- an older Hyprland should still restore, just without silent moves.
+# On a cold boot the terminal window is launched by this very restore, and
+# herdr's server only starts once that window runs `herdr`. Checking once would
+# always lose that race and silently skip every agent, so wait for it.
+wait_for_herdr() {
+  local deadline=$((SECONDS + ${1:-45})) proto
+  while ((SECONDS < deadline)); do
+    proto="$(timeout 5 herdr api snapshot 2>/dev/null | jq -r '.result.snapshot.protocol // 0' 2>/dev/null || echo 0)"
+    [[ "$proto" != "0" ]] && { printf '%s' "$proto"; return 0; }
+    sleep 1
+  done
+  printf '0'
+  return 1
+}
+
+# The server answers before it has finished rebuilding its saved workspaces,
+# so also wait for the panes we mean to resume into to actually exist.
+wait_for_herdr_panes() {
+  local want="$1" deadline=$((SECONDS + ${2:-30})) pane missing
+  while ((SECONDS < deadline)); do
+    missing=0
+    while IFS= read -r pane; do
+      [[ -n "$pane" ]] || continue
+      timeout 5 herdr pane get "$pane" >/dev/null 2>&1 || missing=1
+    done <<<"$want"
+    ((missing == 0)) && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # herdr's own `agent start` requires a pane "at its interactive shell prompt".
 # Mirror that check before typing anything: a pane running make, ssh, or an
 # editor must not receive a resume command as keystrokes.
@@ -53,6 +80,9 @@ pane_at_shell_prompt() {
   esac
 }
 
+# Hyprland 0.56 routes `hyprctl dispatch` through Lua (`hl.dsp.*`); the old
+# positional form is gone. Omarchy's own scripts keep a legacy fallback, so we
+# do too -- an older Hyprland should still restore, just without silent moves.
 hypr_dispatch() {
   local lua="$1" legacy="${2:-}"
   hyprctl dispatch "$lua" >/dev/null 2>&1 && return 0
@@ -83,17 +113,33 @@ launch_app() {
   disown 2>/dev/null || true
 }
 
-# Wait for a window of this class to appear so it can be placed. Restores stay
-# ordered instead of racing every launch at once.
-await_window() {
-  local class="$1" known="$2" deadline=$((SECONDS + 8)) addr
-  while ((SECONDS < deadline)); do
-    addr="$(hyprctl -j clients | jq -r --arg c "$class" --argjson k "$known" '
+# Every address already spoken for: windows present when the restore started,
+# plus each one we have since placed. A newly mapped window is any address not
+# in here, which is what lets placement run after all the launches rather than
+# blocking on each one in turn.
+CLAIMED='[]'
+
+claim() { CLAIMED="$(jq -c --arg a "$1" '. + [$a]' <<<"$CLAIMED")"; }
+
+# Place whatever has appeared since the last sweep. A cold-booting Electron app
+# routinely needs 20s or more, so waiting on each launch in turn would
+# serialise the whole restore behind the slowest one -- and time out anyway.
+place_pending() {
+  local line class ws addr remaining=0
+  local -a still=()
+  for line in ${PENDING[@]+"${PENDING[@]}"}; do
+    IFS=$'\t' read -r class ws <<<"$line"
+    addr="$(hyprctl -j clients | jq -r --arg c "$class" --argjson k "$CLAIMED" '
       [ .[] | select(.class == $c) | .address ] - $k | .[0] // empty')"
-    [[ -n "$addr" ]] && { printf '%s' "$addr"; return 0; }
-    sleep 0.25
+    if [[ -n "$addr" ]]; then
+      window_to_workspace "$addr" "$ws"
+      claim "$addr"
+    else
+      still+=("$line"); remaining=$((remaining + 1))
+    fi
   done
-  return 1
+  PENDING=(${still[@]+"${still[@]}"})
+  return "$remaining"
 }
 
 SNAP="$(resolve_snapshot "$SNAP_ARG")"
@@ -108,6 +154,8 @@ if [[ "$saved_topology" != "$live_topology" ]]; then
 fi
 
 LIVE="$(hyprctl -j clients)"
+CLAIMED="$(jq -c '[ .[].address ]' <<<"$LIVE")"
+PENDING=()
 launched=0; reused=0; skipped=0; parked=0
 PARKED_LIST=""
 
@@ -143,7 +191,7 @@ while IFS= read -r w; do
       ((${#argv[@]})) || { skipped=$((skipped + 1)); continue; }
       printf -v cmd '%q ' "${argv[@]}"; cmd="${cmd% }"
       ;;
-    webapp) ;;   # command already carries the URL
+    webapp|known) ;;   # command already carries the URL / desktop launcher
     guess)
       if ((INCLUDE_UNCERTAIN)); then :; else
         parked=$((parked + 1)); PARKED_LIST+="${PARKED_LIST:+, }$class"
@@ -162,20 +210,30 @@ while IFS= read -r w; do
   if ((DRY)); then
     printf '  would launch: %s  (workspace %s, cwd %s)\n' "$cmd" "$ws" "${cwd:-none}"
   else
-    known="$(hyprctl -j clients | jq -c --arg c "$class" '[ .[] | select(.class == $c) | .address ]')"
     launch_app "$cmd" "$cwd"
-    # Placing after the window maps costs a brief flash on the current
-    # workspace, but it is the only way that works without a preloaded rule.
-    if new_addr="$(await_window "$class" "$known")"; then
-      window_to_workspace "$new_addr" "$ws"
-    else
-      say "  note    $class did not appear within 8s; left wherever it lands"
-    fi
+    PENDING+=("$class"$'\t'"$ws")
+    # Place anything that has already mapped, so quick apps reach their
+    # workspace while the slow ones are still starting.
+    place_pending || true
   fi
   launched=$((launched + 1))
   say "  launch  $class -> workspace $ws  [$tier]"
   ((DRY)) || sleep "$STAGGER"
 done < <(jq -c '.windows[]' "$J")
+
+# Sweep for late arrivals. Leaving a cold-booted browser on whatever workspace
+# happened to be focused is exactly the mess this plugin exists to prevent.
+if ((DRY == 0)) && ((${#PENDING[@]} > 0)); then
+  say "  placing ${#PENDING[@]} window(s) still starting up..."
+  place_deadline=$((SECONDS + ${RECALL_PLACE_TIMEOUT:-45}))
+  while ((${#PENDING[@]} > 0)) && ((SECONDS < place_deadline)); do
+    sleep 1
+    place_pending || true
+  done
+  for line in ${PENDING[@]+"${PENDING[@]}"}; do
+    say "  note    ${line%%$'\t'*} never appeared in time; left wherever it landed"
+  done
+fi
 
 # --------------------------------------------------------------------- herdr
 # herdr's own server already restores workspaces, tabs, panes and their cwds
@@ -183,9 +241,18 @@ done < <(jq -c '.windows[]' "$J")
 # each pane, so that is all we add back.
 if ((WITH_AGENTS)) && [[ "$(jq -r '.terminal.herdr.available' "$J")" == "true" ]] && have herdr; then
   saved_proto="$(jq -r '.terminal.herdr.protocol' "$J")"
-  live_proto="$(timeout 5 herdr api snapshot 2>/dev/null | jq -r '.result.snapshot.protocol // 0' 2>/dev/null || echo 0)"
+  want_panes="$(jq -r '.terminal.herdr.panes[]? | select((.agentKind // "") != "") | .pane_id' "$J")"
+  if ((DRY)); then
+    live_proto="$saved_proto"
+  else
+    say "  herdr   waiting for the server to come up…"
+    live_proto="$(wait_for_herdr 45 || true)"
+    if [[ "$live_proto" != "0" ]] && ! wait_for_herdr_panes "$want_panes" 30; then
+      say "  herdr   some saved panes never appeared; resuming into the ones that did"
+    fi
+  fi
   if [[ "$live_proto" == "0" ]]; then
-    say "  herdr   not answering; skipping agent resume"
+    say "  herdr   did not come up within 45s; skipping agent resume"
   elif [[ "$saved_proto" != "$live_proto" ]]; then
     say "  herdr   protocol changed ($saved_proto -> $live_proto); skipping agent resume"
   else
