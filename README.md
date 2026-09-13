@@ -146,6 +146,7 @@ agent_resume_command() {
 | `apps/slack.sh` | Electron rewrites its argv into one blob, so use the desktop entry instead; strip `%U` and `-s` |
 | `apps/spotify.sh` | The running process carries a bare `--uri` left over from the desktop entry's `%u` |
 | `apps/chromium.sh` | Needs `--restore-last-session` or you get only pinned tabs; must start before its web apps; restores its own windows |
+| `apps/ghostty.sh` | `/proc` only knows how the window was opened, not that the shell inside ran `herdr`; walks the process tree at save time and relaunches with `-e herdr` so the server is up before the agent pass |
 | `agents/claude.sh` | Trust lives in `~/.claude.json`; resumes with `--resume <id>` or `--continue` |
 | `agents/codex.sh` | Trust lives in `~/.codex/config.toml`; resumes with `codex resume <id>`; has no `--continue` |
 
@@ -173,6 +174,13 @@ Terminal backends are detected, never required — herdr, tmux, or neither.
 herdr already restores its own workspaces, tabs, panes and their working
 directories from `~/.config/herdr/session.json`. What it does not restore is
 which agent was living in each pane, so that is the only thing this adds.
+
+None of that happens unless the herdr server is running, and on a cold boot
+nothing starts it but the terminal window that hosted it — which is why
+`apps/ghostty.sh` relaunches that window as `ghostty -e herdr` rather than as
+the bare shell `/proc` reported. A terminal without a handler comes back as a
+plain prompt, the server never appears, and the log reads
+`herdr did not come up within 45s; skipping agent resume`.
 
 A session id is only accepted when one of these produced it:
 

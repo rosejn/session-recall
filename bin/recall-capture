@@ -142,13 +142,22 @@ while IFS= read -r client; do
   fi
   handler_note="$(handler_coverage_note "$class" "$tier")"
 
+  # A handler may know things /proc cannot say about this window -- what was
+  # running inside a terminal, say -- so let it fold extra state into the
+  # record while the processes still exist to be asked.
+  extra='{}'
+  if [[ -n "$handler_path" ]]; then
+    extra="$(app_hook_capture "$handler_path" "$client" "$pid" 2>/dev/null || true)"
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$extra" || extra='{}'
+  fi
+
   add_window "$(jq -nc \
     --argjson c "$client" \
     --arg handler "$handler" --arg handlerNote "$handler_note" \
     --arg tier "$tier" --arg cmd "$cmd" --arg cwd "$cwd" \
     --arg reason "$reason" --argjson argv "${argv_json:-null}" \
     --argjson argvBlob "$argv_blob" \
-    --arg activeAddr "$ACTIVE_ADDR" '
+    --arg activeAddr "$ACTIVE_ADDR" --argjson extra "$extra" '
     {
       address: $c.address, class: $c.class, initialClass: $c.initialClass,
       title: $c.title, pid: $c.pid,
@@ -159,7 +168,7 @@ while IFS= read -r client; do
       launch: { tier: $tier, command: $cmd, cwd: $cwd, argv: $argv,
                 argvBlob: $argvBlob, reason: $reason,
                 handler: $handler, handlerNote: $handlerNote }
-    }')"
+    } * $extra')"
 done < <(jq -c --argjson ig "$IGNORE" '.[] | select(.class as $c | $ig | index($c) == null)' <<<"$CLIENTS")
 
 # ------------------------------------------------------------- herdr backend

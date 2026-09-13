@@ -142,9 +142,14 @@ proc_cwd() {
 }
 
 proc_children() {
-  local pid="$1"
-  [[ -r "/proc/$pid/task/$pid/children" ]] || return 0
-  tr ' ' '\n' < "/proc/$pid/task/$pid/children" 2>/dev/null | grep -E '^[0-9]+$' || true
+  local pid="$1" f
+  # Each thread lists only the children it forked itself, and a GTK app such
+  # as ghostty spawns its shell from a worker thread, so the main thread's
+  # file is empty. Read every thread's list.
+  [[ -d "/proc/$pid/task" ]] || return 0
+  for f in /proc/"$pid"/task/*/children; do
+    [[ -r "$f" ]] && tr ' ' '\n' < "$f" 2>/dev/null
+  done | grep -E '^[0-9]+$' | sort -un || true
 }
 
 # --------------------------------------------------------------- agent lookup
