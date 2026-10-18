@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for session-recall. Sourced, never executed.
 
-RECALL_VERSION="0.3.0"
+RECALL_VERSION="0.4.0"
 RECALL_FORMAT=1
 RECALL_STATE="${RECALL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-recall}"
 RECALL_SNAPS="$RECALL_STATE/snapshots"
@@ -251,7 +251,32 @@ find_codex_session_file() {
   return 1
 }
 
-# Tier 2 (claude): the terminal title is the session's own summary line, so a
+# Tier 2 (claude): Claude Code registers every interactive process in
+# ~/.claude/sessions/<pid>.json with its session id, and stamps the record with
+# the process start time so a recycled pid can never be mistaken for it. An
+# exact join, so it outranks every heuristic below.
+proc_start_ticks() {
+  local stat rest
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  rest="${stat##*) }"
+  set -- $rest
+  printf '%s' "${20}"
+}
+
+match_claude_by_pid_registry() {
+  local pid="$1" file="$HOME/.claude/sessions/$1.json" id start
+  [[ -f "$file" ]] || return 1
+  start="$(proc_start_ticks "$pid" 2>/dev/null || true)"
+  id="$(jq -r --arg s "$start" '
+    select((.procStart // "" | tostring) == $s or (.procStart // "") == "")
+    | .sessionId // empty' "$file" 2>/dev/null)" || return 1
+  [[ "$id" =~ $UUID_RE ]] || return 1
+  MATCHED_ID="$id"
+  MATCHED_FILE="$(find_claude_session_file "$id" 2>/dev/null || true)"
+  [[ -n "$MATCHED_FILE" ]]
+}
+
+# Tier 3 (claude): the terminal title is the session's own summary line, so a
 # unique grep hit across that project's transcripts identifies the session.
 # Ambiguity is a failure, not a coin flip -- a wrong resume is worse than none.
 match_claude_by_title() {
@@ -274,6 +299,32 @@ match_claude_by_title() {
 
 # Tier 2 (codex): codex tags its own log rows with the owning pid, which is an
 # exact join rather than a heuristic.
+codex_user_session_file() {
+  local first
+  IFS= read -r first < "$1" || return 1
+  jq -e '.type == "session_meta" and
+    (.payload.thread_source != "subagent") and
+    ((.payload.source | type) != "object" or .payload.source.subagent == null)' \
+    >/dev/null 2>&1 <<<"$first"
+}
+
+# Resumed conversations can predate the current CLI process by days. Match a
+# unique saved session name and cwd before considering launch-time proximity.
+match_codex_by_title() {
+  local cwd="$1" title="${2%% | *}" db="$HOME/.codex/state_5.sqlite" rows id file
+  have sqlite3 || return 1
+  [[ -f "$db" && -n "$title" ]] || return 1
+  rows="$(sqlite3 -readonly -json "$db" "SELECT id, rollout_path FROM threads
+    WHERE cwd = '${cwd//\'/\'\'}' AND (name = '${title//\'/\'\'}' OR title = '${title//\'/\'\'}')
+      AND archived = 0 AND COALESCE(thread_source, '') != 'subagent';" 2>/dev/null)" || return 1
+  [[ "$(jq 'length' <<<"$rows")" == 1 ]] || return 1
+  id="$(jq -r '.[0].id' <<<"$rows")"
+  file="$(jq -r '.[0].rollout_path' <<<"$rows")"
+  [[ "$id" =~ $UUID_RE && -f "$file" ]] || return 1
+  codex_user_session_file "$file" || return 1
+  MATCHED_ID="$id"; MATCHED_FILE="$file"
+}
+
 match_codex_by_process_log() {
   local root_pid="$1" db="$HOME/.codex/logs_2.sqlite" pid child thread_id file
   local -a queue=("$root_pid") matches=()
@@ -285,7 +336,9 @@ match_codex_by_process_log() {
       thread_id="$(sqlite3 "$db" "SELECT thread_id FROM logs WHERE process_uuid LIKE 'pid:$pid:%' AND thread_id IS NOT NULL GROUP BY thread_id ORDER BY MIN(ts), thread_id LIMIT 1;" 2>/dev/null)" || true
       if [[ "$thread_id" =~ $UUID_RE ]]; then
         file="$(find_codex_session_file "$thread_id" 2>/dev/null || true)"
-        [[ -n "$file" ]] && matches+=("$thread_id"$'\t'"$file")
+        if [[ -n "$file" ]] && codex_user_session_file "$file"; then
+          matches+=("$thread_id"$'\t'"$file")
+        fi
       fi
     fi
     while IFS= read -r child; do
@@ -311,7 +364,9 @@ match_codex_by_launch() {
     [[ -d "$day" ]] || continue
     while IFS= read -r -d '' file; do
       IFS= read -r first < "$file" || continue
-      meta="$(jq -r 'select(.type == "session_meta") | [.payload.id, .payload.timestamp, .payload.cwd] | @tsv' <<<"$first" 2>/dev/null)" || continue
+      meta="$(jq -r 'select(.type == "session_meta" and .payload.thread_source != "subagent"
+        and ((.payload.source | type) != "object" or .payload.source.subagent == null))
+        | [.payload.id, .payload.timestamp, .payload.cwd] | @tsv' <<<"$first" 2>/dev/null)" || continue
       [[ -n "$meta" ]] || continue
       IFS=$'\t' read -r id ts fcwd <<<"$meta"
       [[ "$id" =~ $UUID_RE && "$fcwd" == "$cwd" ]] || continue
@@ -342,10 +397,14 @@ identify_agent() {
   fi
 
   MATCHED_ID=""; MATCHED_FILE=""
-  if [[ "$AGENT_KIND" == "claude" ]] && match_claude_by_title "$cwd" "$title"; then
+  if [[ "$AGENT_KIND" == "claude" ]] && match_claude_by_pid_registry "$AGENT_PID"; then
+    AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="pid-registry"; AGENT_SESSION_FILE="$MATCHED_FILE"
+  elif [[ "$AGENT_KIND" == "claude" ]] && match_claude_by_title "$cwd" "$title"; then
     AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="pane-title"; AGENT_SESSION_FILE="$MATCHED_FILE"
   elif [[ "$AGENT_KIND" == "codex" ]] && match_codex_by_process_log "$AGENT_PID"; then
     AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="process-log"; AGENT_SESSION_FILE="$MATCHED_FILE"
+  elif [[ "$AGENT_KIND" == "codex" ]] && match_codex_by_title "$cwd" "$title"; then
+    AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="pane-title"; AGENT_SESSION_FILE="$MATCHED_FILE"
   elif [[ "$AGENT_KIND" == "codex" ]] && match_codex_by_launch "$AGENT_PID" "$cwd"; then
     AGENT_SESSION_ID="$MATCHED_ID"; AGENT_METHOD="launch-time"; AGENT_SESSION_FILE="$MATCHED_FILE"
   elif agent_supports_continue "$AGENT_KIND" && agent_has_history "$AGENT_KIND" "$cwd"; then

@@ -55,6 +55,14 @@ handler_is_singleton() {
   [[ "$(handler_meta "$1" singleton)" == "true" ]]
 }
 
+# An app whose windows must be finished one at a time: the restore waits for
+# each window to appear and runs its post-launch hook before launching the
+# next one of the same handler. Needed when the hook talks to the app about
+# "the newest window", or leaves state that the next window would consume.
+handler_is_serial() {
+  [[ "$(handler_meta "$1" serialize)" == "true" ]]
+}
+
 # --- app hooks -------------------------------------------------------------
 # Each returns empty when the handler has no opinion, so the caller falls back
 # to the generic recipe rather than to nothing.
@@ -77,6 +85,40 @@ app_hook_command() {
     source "$handler"
     declare -F app_command >/dev/null || exit 1
     app_command "$window" )
+}
+
+# One line per thing the window will bring back beyond itself (tabs, say),
+# for the dry run and the log. Optional.
+app_hook_plan() {
+  local handler="$1" window="$2"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F app_plan >/dev/null || exit 0
+    app_plan "$window" )
+}
+
+# Runs just before the window is launched (never in a dry run): a chance to
+# leave state the freshly started app will pick up. Optional.
+app_hook_prepare() {
+  local handler="$1" window="$2"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F app_prepare >/dev/null || exit 0
+    app_prepare "$window" )
+}
+
+# Runs once the window is on screen, with the address it came back as. This is
+# where an app is driven into the rest of its saved state -- opening tabs, for
+# instance. Prints progress lines for the log. Optional.
+app_hook_post_launch() {
+  local handler="$1" window="$2" addr="$3"
+  [[ -n "$handler" && -f "$handler" ]] || return 1
+  ( set +e
+    source "$handler"
+    declare -F app_post_launch >/dev/null || exit 0
+    app_post_launch "$window" "$addr" )
 }
 
 # --- agent hooks -----------------------------------------------------------

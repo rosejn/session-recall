@@ -104,7 +104,12 @@ cmd_status() {
     "WINDOWS",
     (.windows[] | "  [\(.launch.tier | (. + "        ")[0:7])] ws\(.workspace.id)  \(.class)\n            \(
         (if (.launch.command // "") != "" then .launch.command
-         else ((.launch.argv // []) | join(" ")) end) | .[0:96])"),
+         else ((.launch.argv // []) | join(" ")) end) | .[0:96])",
+        (.app.tabs[]? | "            tab  \(.cwd | sub("^" + env.HOME; "~"))  \(
+          if .herdr then "herdr " + (.herdrArgs | join(" "))
+          elif (.agentKind // "") != "" then .agentKind + " (" + .agentMethod + ")"
+          elif .program != null then (.program | join(" ") | .[0:60])
+          else "shell" end)")),
     "",
     "AGENTS"
   ' "$d/snapshot.json"
@@ -112,6 +117,8 @@ cmd_status() {
     ((.terminal.herdr.panes // []) | map({loc: .pane_id} + .))
     + ((.terminal.tmux.sessions // []) | map(.name as $s | .windows[] | .index as $w
         | .panes[] | {loc: ($s + ":" + ($w|tostring) + "." + (.index|tostring))} + .))
+    + ([.windows[] | select(.app.tabs != null) | .class as $c | .app.tabs | to_entries[]
+        | {loc: ($c + " tab " + ((.key + 1)|tostring))} + .value])
     | map(select((.agentKind // "") != ""))
     | if length == 0 then "  (none captured)" else
         (.[] | "  \(.loc)  \(.agentKind)  via \(.agentMethod)  \(.agentSessionId // "-")\n        \(.cwd)")
@@ -183,6 +190,20 @@ cmd_doctor() {
   echo
   printf '  sqlite3  %s  (improves codex session matching)\n' \
     "$(have sqlite3 && echo present || echo absent)"
+  echo
+  echo "Terminal tabs (ghostty):"
+  local shell hook
+  shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; shell="$(basename "${shell:-${SHELL:-sh}}")"
+  case "$shell" in
+    fish) hook="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/session-recall.fish"
+          if [[ -f "$hook" ]]; then printf '  ok       fish       tab hook installed (%s)\n' "$hook"
+          else printf '  pending  fish       tab hook is installed on the first restore\n'; fi ;;
+    bash|zsh)
+          if grep -qs 'session-recall.bash' "$HOME/.${shell}rc"; then printf '  ok       %-10s tab hook sourced from ~/.%src\n' "$shell" "$shell"
+          else printf '  MISSING  %-10s add to ~/.%src:  . %s/shell/session-recall.bash\n' "$shell" "$shell" "$(dirname "$BIN")"; fi ;;
+    *)    printf '  none     %-10s no tab hook for this shell; tabs come back as one window\n' "$shell" ;;
+  esac
+  printf '  gdbus    %s  (opens tabs in a running ghostty)\n' "$(have gdbus && echo present || echo absent)"
   echo
   echo "State:    $RECALL_STATE"
   echo "Autosave: $(config_get autoSave true)   Auto-restore: $(config_get autoRestore true)"

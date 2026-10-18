@@ -22,6 +22,17 @@ RECTS="$(jq -c --argjson live "$LIVE_ADDRS" '[ .[] | select(.id as $i | $live | 
 COUNT="$(jq 'length' <<<"$RECTS")"
 (( COUNT > 0 )) || exit 0
 
+# Extra windows change every split ratio. Preserve their layout rather than
+# trying to impose a smaller saved tree on top of them.
+EXTRA="$(hyprctl -j clients | jq --arg ws "$WS" --argjson rects "$RECTS" '
+  [.[] | select((.workspace.id | tostring) == $ws or .workspace.name == $ws)
+       | select(.floating != true)
+       | select(.address as $a | any($rects[]; .id == $a) | not)] | length')"
+if ((EXTRA > 0)); then
+  echo "recall-layout: ws$WS has $EXTRA additional tiled window(s); preserving its layout" >&2
+  exit 0
+fi
+
 PLAN="$(jq -f "$BIN/recall-layout.jq" <<<"$RECTS")"
 ROOT="$(jq -r '.root' <<<"$PLAN")"
 COMPLETE="$(jq -r '.complete' <<<"$PLAN")"

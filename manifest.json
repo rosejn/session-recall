@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "session-recall",
   "name": "Session Recall",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "rosejn",
   "license": "MIT",
-  "description": "Automatically remembers your desktop \u2014 windows, workspaces, terminal working directories, and running coding-agent sessions \u2014 and brings it all back after a reboot.",
+  "description": "Automatically remembers your desktop \u2014 windows, workspaces, terminal tabs and working directories, and running coding-agent sessions \u2014 and brings it all back after a reboot.",
   "kinds": [
     "service",
     "bar-widget"

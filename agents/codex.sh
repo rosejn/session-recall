@@ -21,11 +21,18 @@ agent_trust() {
 }
 
 agent_resume_command() {
-  local cwd="$1" id="$2" method="$3" exe
+  local cwd="$1" id="$2" method="$3" exe script
   exe="$(command -v codex 2>/dev/null)" || return 1
   [[ -n "$exe" ]] || return 1
   # codex has no --continue; without a verified id there is nothing to reopen.
   [[ "$method" != "continue" ]] || return 1
   [[ -n "$id" ]] || return 1
-  printf '%q resume %q' "$exe" "$id"
+  # Let the supported daemon manager finish cold-boot startup. If it cannot,
+  # keep the saved conversation usable through the CLI's documented fallback.
+  # This command is typed into the user's shell (often fish). Keep Bash
+  # control flow inside an explicit interpreter so fish does not wait for an
+  # `end` forever. exec also leaves the actual agent visible in the process tree.
+  printf -v script 'if timeout 20 %q app-server daemon start >/dev/null 2>&1; then exec %q resume %q; else exec %q --no-daemon resume %q; fi' \
+    "$exe" "$exe" "$id" "$exe" "$id"
+  printf 'bash -c %q' "$script"
 }

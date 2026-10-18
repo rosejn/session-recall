@@ -128,22 +128,46 @@ claim() { CLAIMED="$(jq -c --arg a "$1" '. + [$a]' <<<"$CLAIMED")"; }
 # routinely needs 20s or more, so waiting on each launch in turn would
 # serialise the whole restore behind the slowest one -- and time out anyway.
 place_pending() {
-  local line class ws addr remaining=0
+  local line class ws addr title idx remaining=0
   local -a still=()
   for line in ${PENDING[@]+"${PENDING[@]}"}; do
     IFS=$'\t' read -r class ws idx <<<"$line"
-    addr="$(hyprctl -j clients | jq -r --arg c "$class" --argjson k "$CLAIMED" '
-      [ .[] | select(.class == $c) | .address ] - $k | .[0] // empty')"
+    title="$(jq -r --argjson i "$idx" '.[$i].title' <<<"$WINS")"
+    addr="$(hyprctl -j clients | jq -r --arg c "$class" --arg t "$title" --argjson k "$CLAIMED" '
+      [ .[] | select(.class == $c) | select(.address as $a | $k | index($a) == null) ] as $same
+      | (($same | map(select(.title == $t)) | .[0]),
+         (if ($c | test("^(google-chrome|chromium|Chromium|chrome|brave|brave-browser)$"))
+          then empty else $same[0] end)) | .address // empty' | head -1)"
     if [[ -n "$addr" ]]; then
       window_to_workspace "$addr" "$ws"
       claim "$addr"
       record_geom "$addr" "$idx"
+      post_launch "$class" "$idx" "$addr"
     else
       still+=("$line"); remaining=$((remaining + 1))
     fi
   done
   PENDING=(${still[@]+"${still[@]}"})
   return "$remaining"
+}
+
+pending_has() {
+  local line
+  for line in ${PENDING[@]+"${PENDING[@]}"}; do
+    [[ "${line##*$'\t'}" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# The window is on screen; let its handler carry on from there (tabs and the
+# like). Every line the hook prints is worth keeping in the log.
+post_launch() {
+  local class="$1" idx="$2" addr="$3" h line
+  h="$(app_handler_for "$class" 2>/dev/null)" || return 0
+  [[ -n "$h" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && say "  $line"
+  done < <(app_hook_post_launch "$h" "$(jq -c --argjson i "$idx" '.[$i]' <<<"$WINS")" "$addr" 2>/dev/null || true)
 }
 
 SNAP="$(resolve_snapshot "$SNAP_ARG")"
@@ -174,7 +198,7 @@ GEOM='[]'
 record_geom() {
   local addr="$1" idx="$2"
   GEOM="$(jq -c --arg a "$addr" --argjson i "$idx" --argjson w "$WINS" '
-    . + [ ($w[$i] | { id: $a, ws: .workspace.id,
+    . + [ ($w[$i] | { id: $a, idx: $i, ws: .workspace.id,
                       x: .at[0], y: .at[1], w: .size[0], h: .size[1],
                       floating: .floating, fullscreen: .fullscreen }) ]' <<<"$GEOM")"
 }
@@ -183,22 +207,32 @@ PARKED_LIST=""
 
 # ------------------------------------------------------------------- windows
 while IFS= read -r w; do
+  # A browser can restore web apps during its own startup. Reconcile those
+  # arrivals before launching their recipes, to avoid a second copy.
+  if ((DRY == 0)); then
+    place_pending || true
+    LIVE="$(hyprctl -j clients | jq -c --argjson placed "$GEOM" '
+      [.[] | select(.address as $a | any($placed[]; .id == $a) | not)]')"
+  fi
   idx="$(jq -r   '.idx' <<<"$w")"
   class="$(jq -r '.class' <<<"$w")"
   title="$(jq -r '.title' <<<"$w")"
-  ws="$(jq -r    '.workspace.id' <<<"$w")"
+  ws="$(jq -r    'if .workspace.id < 0 then .workspace.name else .workspace.id end' <<<"$w")"
   tier="$(jq -r  '.launch.tier' <<<"$w")"
   cmd="$(jq -r   '.launch.command // ""' <<<"$w")"
   cwd="$(jq -r   '.launch.cwd // ""' <<<"$w")"
 
   # Already on screen? Move it instead of starting a second copy. Title is a
   # weak key on its own, so class must agree too.
-  live_addr="$(jq -r --arg c "$class" --arg t "$title" '
+  live_addr="$(jq -r --arg c "$class" --arg t "$title" --argjson saved "$WINS" '
     [ .[] | select(.class == $c) ] as $same
-    | (($same[] | select(.title == $t) | .address), ($same[0].address // empty))
+    | (($same[] | select(.title == $t) | .address), (if ($c | test("^(google-chrome|chromium|Chromium|chrome|brave|brave-browser)$")) then empty
+       else $same[] | select(.title as $lt | any($saved[]; .class == $c and .title == $lt) | not) | .address end))
     | select(. != null)' <<<"$LIVE" | head -1)"
 
-  if [[ -n "$live_addr" ]]; then
+  # RECALL_NO_REUSE=1 forces the launch path even when a window is already
+  # open, so a handler can be exercised on a live desktop.
+  if [[ -n "$live_addr" && -z "${RECALL_NO_REUSE:-}" ]]; then
     run "window_to_workspace $(printf '%q' "$live_addr") $(printf '%q' "$ws")"
     LIVE="$(jq -c --arg a "$live_addr" 'map(select(.address != $a))' <<<"$LIVE")"
     record_geom "$live_addr" "$idx"
@@ -255,10 +289,11 @@ while IFS= read -r w; do
   # app brings back lands on the workspace it was saved on.
   singleton_skip=0
   if [[ -n "$handler_path" ]] && handler_is_singleton "$handler_path"; then
-    if grep -qxF "$class" <<<"$SINGLETON_STARTED"; then
+    singleton_key="$class:$cmd"
+    if grep -qxF "$singleton_key" <<<"$SINGLETON_STARTED"; then
       singleton_skip=1
     else
-      SINGLETON_STARTED+="${SINGLETON_STARTED:+$'\n'}$class"
+      SINGLETON_STARTED+="${SINGLETON_STARTED:+$'\n'}$singleton_key"
     fi
   fi
 
@@ -267,9 +302,13 @@ while IFS= read -r w; do
       printf '  would place (restored by %s itself): %s\n' "$handler_name" "$class"
     else
       printf '  would launch: %s  (workspace %s, cwd %s)\n' "$cmd" "$ws" "${cwd:-none}"
+      [[ -n "$handler_path" ]] && app_hook_plan "$handler_path" "$w" 2>/dev/null | sed 's/^/      /'
     fi
   else
-    ((singleton_skip)) || launch_app "$cmd" "$cwd"
+    if ((singleton_skip == 0)); then
+      [[ -n "$handler_path" ]] && { app_hook_prepare "$handler_path" "$w" >/dev/null 2>&1 || true; }
+      launch_app "$cmd" "$cwd"
+    fi
     PENDING+=("$class"$'\t'"$ws"$'\t'"$idx")
     # Place anything that has already mapped, so quick apps reach their
     # workspace while the slow ones are still starting.
@@ -282,6 +321,16 @@ while IFS= read -r w; do
     say "  launch  $class -> workspace $ws  [$tier]"
   fi
   logmsg "          $(jq -r '.launch.handlerNote // "no coverage note"' <<<"$w")"
+  # A serialised handler gets this window finished -- on screen and through
+  # its post-launch hook -- before the next launch of anything.
+  if ((DRY == 0 && singleton_skip == 0)) && [[ -n "$handler_path" ]] && handler_is_serial "$handler_path"; then
+    serial_deadline=$((SECONDS + ${RECALL_SERIAL_TIMEOUT:-15}))
+    while pending_has "$idx" && ((SECONDS < serial_deadline)); do
+      sleep 0.5
+      place_pending || true
+    done
+    pending_has "$idx" && say "  note    $class did not appear within ${RECALL_SERIAL_TIMEOUT:-15}s; its handler could not finish it"
+  fi
   ((DRY)) || sleep "$STAGGER"
 done < <(
   # Launch order is load-bearing for anything whose first process wins: a
@@ -318,6 +367,14 @@ if ((DRY == 0)) && ((${#PENDING[@]} > 0)); then
   done
 fi
 
+# Reassert placement after startup before rebuilding split trees.
+if ((DRY == 0)); then
+  while IFS=$'\t' read -r addr idx; do
+    ws="$(jq -r --argjson i "$idx" '.[$i] | if .workspace.id < 0 then .workspace.name else .workspace.id end' <<<"$WINS")"
+    window_to_workspace "$addr" "$ws" || say "  note    could not place $addr on $ws"
+  done < <(jq -r '.[] | [.id, .idx] | @tsv' <<<"$GEOM")
+fi
+
 # ------------------------------------------------------------------ geometry
 # Only now, with every window present, can sizes be applied: a tiled window's
 # geometry belongs to the split tree, so one missing window changes all of them.
@@ -331,6 +388,9 @@ if ((WITH_GEOMETRY)) && ((DRY == 0)) && [[ "$(jq 'length' <<<"$GEOM")" != "0" ]]
   # rebuilt.
   while IFS=$'\t' read -r id x y w h; do
     [[ -n "$id" ]] || continue
+    read -r mx my mw mh < <(hyprctl -j monitors | jq -r '.[0] | [.x, .y, ((.width / .scale)|floor), ((.height / .scale)|floor)] | @tsv')
+    x=$(( x < mx ? mx : (x + w > mx + mw ? mx + mw - w : x) ))
+    y=$(( y < my ? my : (y + h > my + mh ? my + mh - h : y) ))
     hypr_dispatch "hl.dsp.window.float({ window = \"address:$id\", action = \"on\" })" || true
     hypr_dispatch "hl.dsp.window.resize({ window = \"address:$id\", x = $w, y = $h, relative = false })" \
       "resizewindowpixel exact $w $h,address:$id" || true
@@ -352,7 +412,8 @@ if ((WITH_GEOMETRY)) && ((DRY == 0)) && [[ "$(jq 'length' <<<"$GEOM")" != "0" ]]
       [ .[] | select(.ws == $id and .floating != true)
             | { id, x, y, w, h } ]' <<<"$GEOM" > "$geom_tmp/ws$wsid.json"
     [[ "$(jq 'length' "$geom_tmp/ws$wsid.json")" != "0" ]] || continue
-    "$(dirname "$(readlink -f "$0")")/recall-layout" "$wsid" "$geom_tmp/ws$wsid.json" || \
+    layout_ws="$(jq -r --argjson id "$wsid" '.workspaces[] | select(.id == $id) | if .id < 0 then .name else .id end' "$J")"
+    "$(dirname "$(readlink -f "$0")")/recall-layout" "${layout_ws:-$wsid}" "$geom_tmp/ws$wsid.json" || \
       say "  note    could not fully rebuild workspace $wsid geometry"
   done < <(jq -r '[ .[] | select(.floating != true) | .ws ] | unique | .[]' <<<"$GEOM")
 
@@ -495,7 +556,7 @@ if ((WITH_AGENTS)) && [[ "$(jq -r '.terminal.tmux.available' "$J")" == "true" ]]
 fi
 
 # ------------------------------------------------------------------- wrap up
-focus_ws="$(jq -r '.windows[] | select(.focused) | .workspace.id' "$J" | head -1)"
+focus_ws="$(jq -r '.windows[] | select(.focused) | if .workspace.id < 0 then .workspace.name else .workspace.id end' "$J" | head -1)"
 [[ -n "$focus_ws" ]] && run "focus_workspace $(printf '%q' "$focus_ws")"
 
 say ""

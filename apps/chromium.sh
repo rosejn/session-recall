@@ -4,38 +4,28 @@
 # recall:priority=10
 # recall:singleton=true
 
-# A browser window shares one pid with every other window of that browser, so
-# /proc can never describe just this one. The browser's own session store knows
-# far more than we could capture -- but only reopens it when asked.
-#
-# Without --restore-last-session a fresh launch shows the start page and, if the
-# profile has pinned tabs, only those, which reads as "my tabs are gone". The
-# flag is exactly what "Continue where you left off" does from the menu.
-#
-# --restore-last-session is only honoured by the process that starts the
-# browser. Omarchy web apps are --app= windows of the *same* browser, so if one
-# of them starts first the flag arrives at an already-running instance and does
-# nothing -- which is exactly how a restore ends up showing only pinned tabs.
-# Hence the low priority number: this window must be launched first.
-#
-# And singleton=true, because restoring the session brings back *every* browser
-# window by itself. Launching once per saved window would restore the session
-# and then add a spare empty window for each one after the first.
-#
-# Note the Omarchy web apps (class chrome-<host>__-Default) are deliberately not
-# claimed here: those are single-purpose --app= windows, handled by the webapp
-# tier, and restoring a whole session into one would be wrong.
+app_capture() {
+  "$RECALL_ROOT/bin/recall-browser-profile" "$1"
+}
+
+# Restore once per profile. Explicit profiles bypass Chrome's profile picker.
+# Session-title evidence also lets old snapshots recover profile identity.
 app_command() {
-  local window="$1" class exe
+  local window="$1" class exe profiles profile command
   class="$(jq -r '.class // ""' <<<"$window")"
   case "$class" in
-    chrome-*) return 1 ;;   # an --app= web app window; not ours
+    chromium|Chromium) exe=chromium ;;
+    brave|brave-browser) exe=brave-browser; command -v "$exe" >/dev/null || exe=brave ;;
+    *) exe=google-chrome-stable; command -v "$exe" >/dev/null || exe=google-chrome ;;
   esac
-  for exe in chromium google-chrome-stable google-chrome brave chrome; do
-    if command -v "$exe" >/dev/null 2>&1; then
-      printf '%s --restore-last-session' "$exe"
-      return 0
-    fi
-  done
-  return 1
+  command -v "$exe" >/dev/null || return 1
+  profiles="$(app_capture "$window")" || return 1
+  command=""
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    printf -v command '%s%s%q --profile-directory=%q --restore-last-session --hide-crash-restore-bubble' \
+      "$command" "${command:+; }" "$exe" "$profile"
+  done < <(jq -r '.browser.profiles[]' <<<"$profiles")
+  [[ -n "$command" ]] || return 1
+  printf 'bash -c %q' "$command"
 }

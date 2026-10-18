@@ -2,9 +2,9 @@
 
 Automatic desktop session save and restore for Omarchy 4 (Quattro).
 
-It remembers your windows and which workspace each one lived on, the working
-directory of every terminal pane, and — the part other session managers skip —
-which coding agent was running in that pane and which conversation it was in.
+It remembers your windows and which workspace each one lived on, every terminal
+tab and pane with its working directory, and — the part other session managers
+skip — which coding agent was running in it and which conversation it was in.
 After a reboot your desktop comes back, and `claude` picks up where it left off.
 
 No `autostart.lua` edits and nothing to remember to press. It is a shell plugin;
@@ -47,6 +47,25 @@ Restoring reconciles instead of recreating: a window that is already open is
 moved to its saved workspace rather than opened a second time. Restoring twice
 does nothing the second time, which also makes it usable as a tidy-up button.
 
+## Browser profiles and crash recovery
+
+Chromium windows launch with an explicit `--profile-directory`,
+`--restore-last-session`, and `--hide-crash-restore-bubble`. This bypasses the
+profile picker and permits automatic restoration after an unclean shutdown.
+The flags must reach the first browser process; changing them while Chrome is
+already running does not change that process's crash-recovery behavior.
+
+Capture records profile identity when the window title matches exactly one
+profile's session files. Older snapshots can use the same evidence at restore
+time. When identity is ambiguous, the last active profiles are used instead.
+Each profile starts once, and restored browser windows are placed by title
+rather than their arrival order. A changed title may prevent placement; the
+restore log names windows it could not match. Web apps retain the profile
+encoded in their window class.
+
+Codex restores first ask the daemon manager to start, with a 20-second timeout.
+If startup fails, the same saved conversation opens with `--no-daemon`.
+
 ## Window geometry
 
 Positions and sizes are restored exactly, not just workspace assignment.
@@ -88,6 +107,12 @@ agents/<name>.sh    a coding agent: how to trust a directory and resume it
 
 Each file is plain bash, sourced in a subshell, so every handler can use the
 same function names without colliding.
+
+Handlers with only `recall:classes` and `app_command` are the common case.
+Beyond that a handler can declare `recall:serialize=true` and define
+`app_prepare` (runs just before the launch), `app_post_launch` (runs once the
+window is on screen, with its address) and `app_plan` (what the dry run
+prints); `apps/ghostty.sh` uses all three to rebuild tabs.
 
 ### An app handler
 
@@ -146,7 +171,7 @@ agent_resume_command() {
 | `apps/slack.sh` | Electron rewrites its argv into one blob, so use the desktop entry instead; strip `%U` and `-s` |
 | `apps/spotify.sh` | The running process carries a bare `--uri` left over from the desktop entry's `%u` |
 | `apps/chromium.sh` | Needs `--restore-last-session` or you get only pinned tabs; must start before its web apps; restores its own windows |
-| `apps/ghostty.sh` | `/proc` only knows how the window was opened, not that the shell inside ran `herdr`; walks the process tree at save time and relaunches with `-e herdr` so the server is up before the agent pass |
+| `apps/ghostty.sh` | `/proc` only knows how the window was opened, not what its tabs were doing; walks the process tree at save time and rebuilds every tab on restore — see [Terminal tabs](#terminal-tabs) |
 | `agents/claude.sh` | Trust lives in `~/.claude.json`; resumes with `--resume <id>` or `--continue` |
 | `agents/codex.sh` | Trust lives in `~/.codex/config.toml`; resumes with `codex resume <id>`; has no `--continue` |
 
@@ -167,6 +192,51 @@ recall logs -n 500 -f  # follow
 The dropdown has a button for it, next to one for `recall doctor`. Every entry
 names the handler that ran, or says which app had none.
 
+## Terminal tabs
+
+A Ghostty window is one Hyprland window however many tabs it holds, and with
+`gtk-single-instance` every window shares one pid, so `hyprctl` and `/proc`
+argv say nothing about the tabs. What they do expose is the process tree:
+each tab's shell is a direct child of the ghostty pid, and the tty's
+foreground process group says what that shell is running. So a save records,
+per tab, the directory and the program — `herdr`, an agent and its session, or
+`ssh leo`.
+
+Getting them back is the harder half. Ghostty's only IPC for tabs is a bare
+`new-tab` action: no directory, no command. So the restore launches the window
+into the first tab's directory, then opens the rest one at a time over D-Bus,
+and a small hook in the shell does the part Ghostty cannot: at its first
+prompt, a fresh tab claims the next queued spec, `cd`s there, and runs the
+program as if you had typed it — a real job, with history and job control. The
+queue lives only for the seconds a restore is opening tabs; the rest of the
+time the hook is inert.
+
+For fish the hook is installed by the first restore, as
+`~/.config/fish/conf.d/session-recall.fish`. bash and zsh have no drop-in
+directory, so add one line to `~/.bashrc` or `~/.zshrc`:
+
+```bash
+. ~/.config/omarchy/plugins/session-recall/shell/session-recall.bash
+```
+
+`recall doctor` says whether the hook is in place. Without it the window still
+comes back, with herdr in its first tab via `-e herdr` when that is where herdr
+was, and the log names the tabs that were left out.
+
+What runs inside a restored tab is deliberately narrow: `herdr`, an agent whose
+session was verified (the same rules as below), and a short list of
+interactive tools — editors, `lazygit`, `htop`, `ssh`, `tmux` and the like,
+kept in `TAB_PROGRAMS` at the top of `apps/ghostty.sh`. A tab that was running
+anything else comes back as a shell in the right directory, and the log says
+what it was running. Relaunching arbitrary commands unattended at boot is not
+a restore anyone can trust.
+
+Tabs and splits look the same from `/proc`, so a split comes back as a tab.
+Tab order is process creation order, which is the tab order unless tabs were
+dragged around. With several Ghostty windows open they all share one pid, so
+which tab belonged to which window is attributed by title and logged as the
+guess it is.
+
 ## Agents
 
 Terminal backends are detected, never required — herdr, tmux, or neither.
@@ -176,17 +246,21 @@ directories from `~/.config/herdr/session.json`. What it does not restore is
 which agent was living in each pane, so that is the only thing this adds.
 
 None of that happens unless the herdr server is running, and on a cold boot
-nothing starts it but the terminal window that hosted it — which is why
-`apps/ghostty.sh` relaunches that window as `ghostty -e herdr` rather than as
-the bare shell `/proc` reported. A terminal without a handler comes back as a
-plain prompt, the server never appears, and the log reads
-`herdr did not come up within 45s; skipping agent resume`.
+nothing starts it but the terminal tab that hosted it — which is why
+`apps/ghostty.sh` records that tab as running `herdr` and starts it there again
+rather than leaving the bare shell `/proc` reported. A terminal without a
+handler comes back as a plain prompt, the server never appears, and the log
+reads `herdr did not come up within 45s; skipping agent resume`.
+
+An agent running straight in a terminal tab, outside herdr or tmux, is found
+the same way and resumed by the same rules.
 
 A session id is only accepted when one of these produced it:
 
 | Method | Agent | What it is |
 |---|---|---|
 | `argv` | all | The id is in the process command line because the session was itself resumed |
+| `pid-registry` | claude | Claude Code registers each running process in `~/.claude/sessions/<pid>.json` with its session id and start time — an exact join |
 | `pane-title` | claude | The terminal title is the session's own summary; a *unique* grep hit across that project's transcripts identifies it |
 | `process-log` | codex | `~/.codex/logs_2.sqlite` tags log rows with the owning pid — an exact join |
 | `launch-time` | codex | Process start time lines up with exactly one rollout header in the same cwd, within 5 minutes |
@@ -243,6 +317,9 @@ live by the service and written by the dropdown or `recall config <key> <value>`
   snapshot, so a docked layout does not silently pile onto a laptop panel.
 - Restoring runs once per boot, keyed on `/proc/sys/kernel/random/boot_id`, so
   restarting the shell never triggers a second restore.
+- A handler is only consulted if it existed when the snapshot was *saved*; a
+  restore reads what the save recorded. Adding a handler pays off from the next
+  automatic snapshot on, not for the one already on disk.
 - The herdr integration is gated on its reported socket `protocol` version and
   skips agent resume rather than guessing if that number moves.
 

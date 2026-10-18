@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Resolve a Chromium profile using saved metadata or session-title evidence.
+
+Read session files without modifying browser state. A shared browser PID cannot
+identify the profile of an individual window.
+"""
+import json
+import os
+from pathlib import Path
+import sys
+
+window = json.loads(sys.argv[1])
+profiles = window.get('browser', {}).get('profiles', [])
+if profiles:
+    print(json.dumps({'browser': {'profiles': profiles, 'source': 'snapshot'}}))
+    sys.exit()
+cls = window.get('class', '').lower()
+folder = ('BraveSoftware/Brave-Browser' if 'brave' in cls else
+          'chromium' if 'chromium' in cls else 'google-chrome')
+root = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / folder
+try:
+    state = json.loads((root / 'Local State').read_text())['profile']
+except (OSError, ValueError, KeyError):
+    state = {}
+known = state.get('info_cache', {})
+title = window.get('title', '')
+for suffix in (' - Google Chrome', ' - Chromium', ' - Brave'):
+    title = title.removesuffix(suffix)
+matches = []
+if title:
+    needle = title.encode('utf-16-le')
+    for profile in known:
+        try:
+            if any(needle in f.read_bytes() for f in (root / profile / 'Sessions').glob('Session_*')):
+                matches.append(profile)
+        except OSError:
+            continue
+if len(matches) == 1:
+    profiles, source = matches, 'session-title'
+else:
+    profiles = [p for p in state.get('last_active_profiles', []) if p in known]
+    if not profiles:
+        profiles = [state.get('last_used', 'Default')]
+    source = 'last-active-profiles'
+# Profile directory names must stay inside the browser data directory.
+profiles = [p for p in profiles if p and '/' not in p and p not in ('.', '..')]
+print(json.dumps({'browser': {'profiles': profiles or ['Default'], 'source': source}}))

@@ -173,7 +173,21 @@ done < <(jq -c --argjson ig "$IGNORE" '.[] | select(.class as $c | $ig | index($
 
 # ------------------------------------------------------------- herdr backend
 HERDR_JSON='{"available":false}'
-if have herdr && herdr_snap="$(timeout 5 herdr api snapshot 2>/dev/null)" && [[ -n "$herdr_snap" ]]; then
+# A failed snapshot here silently costs every herdr agent on the next restore,
+# so retry once and keep the reason for the log instead of discarding it.
+HERDR_ERR=""
+herdr_snap=""
+if have herdr; then
+  for _try in 1 2; do
+    herdr_snap="$(timeout 10 herdr api snapshot 2>"$TMP/herdr.err")" && [[ -n "$herdr_snap" ]] && break
+    HERDR_ERR="exit $?: $(head -c 300 "$TMP/herdr.err" | tr '\n' ' ')"
+    herdr_snap=""
+    sleep 1
+  done
+  rm -f "$TMP/herdr.err"
+  if [[ -n "$herdr_snap" ]]; then HERDR_ERR=""; fi
+fi
+if [[ -n "$herdr_snap" ]]; then
   snap="$(jq -c '.result.snapshot // empty' <<<"$herdr_snap" 2>/dev/null || true)"
   if [[ -n "$snap" ]]; then
     panes='[]'
@@ -202,6 +216,8 @@ if have herdr && herdr_snap="$(timeout 5 herdr api snapshot 2>/dev/null)" && [[ 
       focusedWorkspaceId: ($snap.focused_workspace_id // ""),
       focusedPaneId: ($snap.focused_pane_id // ""),
       panes: $panes }')"
+  else
+    HERDR_ERR="no .result.snapshot in the reply: $(head -c 300 <<<"$herdr_snap" | tr '\n' ' ')"
   fi
 fi
 
@@ -259,9 +275,12 @@ jq -n \
       restorable: ($windows | map(select(.launch.tier == "exact" or .launch.tier == "webapp" or .launch.tier == "known")) | length),
       uncertain: ($windows | map(select(.launch.tier == "guess")) | length),
       unknown: ($windows | map(select(.launch.tier == "none")) | length),
+      # Agents live in herdr panes, tmux panes, or straight in a terminal tab.
       agents: (($herdr.panes // []) + (($tmux.sessions // []) | map(.windows[].panes[]))
+               + ($windows | map(.app.tabs[]?))
                | map(select(.agentKind != null and .agentKind != "")) | length),
       agentsResumable: (($herdr.panes // []) + (($tmux.sessions // []) | map(.windows[].panes[]))
+               + ($windows | map(.app.tabs[]?))
                | map(select((.agentSessionId // "") != "" or (.agentMethod // "") == "continue")) | length)
     }
   }' > "$TMP/snapshot.json"
@@ -279,8 +298,17 @@ log_section "save $NAME ($KIND)"
 jq -r '
   "  \(.counts.windows) windows: \(.counts.restorable) restorable, \(.counts.uncertain) uncertain, \(.counts.unknown) unknown",
   "  \(.counts.agents) agents, \(.counts.agentsResumable) resumable",
-  (.windows[] | "  \(.class)  [\(.launch.tier)]  \(.launch.handlerNote)")
+  (.windows[] | "  \(.class)  [\(.launch.tier)]  \(.launch.handlerNote)",
+                (select(.app.tabs != null) | "          \(.app.tabs | length) tab(s): \(
+                    .app.tabs | map(
+                      (.cwd | sub("^" + env.HOME; "~"))
+                      + (if .herdr then " (herdr)"
+                         elif (.agentKind // "") != "" then " (\(.agentKind) via \(.agentMethod))"
+                         elif .program != null then " (\(.program[0] | split("/") | last))"
+                         else "" end)) | join(", "))"),
+                (select(.app.note != null) | "          note: \(.app.note)"))
 ' "$DEST/snapshot.json" 2>/dev/null | while IFS= read -r l; do logmsg "$l"; done
+[[ -z "$HERDR_ERR" ]] || logmsg "  herdr   snapshot failed, herdr agents NOT captured: $HERDR_ERR"
 
 # Say plainly which apps nobody has taught us about yet. This is the line that
 # turns "my app came back wrong" into "I could write apps/<name>.sh".
