@@ -13,7 +13,7 @@ enabling it is the whole setup.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-session-recall.git --enable
+omarchy plugin add https://github.com/rosejn/session-recall.git --enable
 ```
 
 Or, working from a local checkout:
