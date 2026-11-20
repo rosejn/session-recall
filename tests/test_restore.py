@@ -8,11 +8,49 @@ import tempfile
 import sqlite3
 from datetime import datetime, timedelta, timezone
 import unittest
+import runpy
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class RestoreTests(unittest.TestCase):
+    def test_empty_shutdown_capture_preserves_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            state = home / 'state'
+            saved = state / 'snapshots/auto-before-shutdown'
+            saved.mkdir(parents=True)
+            (saved / 'snapshot.json').write_text('{"windows": [{"class": "ghostty"}]}')
+            for link in ('latest', 'last-auto'):
+                (state / link).symlink_to(saved)
+            binaries = home / 'bin'
+            binaries.mkdir()
+            for name, body in {'hyprctl': 'case "$*" in *activewindow*) echo "{}";; *) echo "[]";; esac', 'herdr': 'exit 1',
+                               'tmux': 'exit 1'}.items():
+                script = binaries / name
+                script.write_text('#!/bin/sh\n' + body + '\n')
+                script.chmod(0o755)
+            result = subprocess.run(['bash', str(ROOT / 'bin/recall-capture'), '--auto'],
+                env=dict(os.environ, HOME=tmp, RECALL_STATE_DIR=str(state),
+                         PATH=str(binaries) + ':' + os.environ['PATH']),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for link in ('latest', 'last-auto'):
+                self.assertEqual((state / link).resolve(), saved)
+            self.assertEqual(list((state / 'snapshots').iterdir()), [saved])
+
+    def test_codex_hook_routes_by_tui_not_inherited_pane(self):
+        route = runpy.run_path(str(ROOT / 'bin/recall-codex-session-hook'))['matching_panes']
+        panes = [{'pane_id': 'w1:p1', 'agent': 'codex'},
+                 {'pane_id': 'w2:p1', 'agent': 'codex'}]
+        processes = {'w1:p1': [{'argv': ['/bin/codex', 'resume', 'mobile']}],
+                     'w2:p1': [{'argv': ['/bin/codex', 'resume', 'kerml']}]}
+        self.assertEqual(route(panes, processes, 'kerml'), ['w2:p1'])
+        self.assertEqual(route(panes, processes, 'desktop-session'), [])
+        # An embedded/shared server must not be mistaken for the terminal UI.
+        processes['w1:p1'] = [{'argv': ['/bin/codex', 'app-server']}]
+        self.assertEqual(route(panes, processes, 'mobile'), [])
+
     def test_codex_title_match_is_unique_and_ignores_subagents(self):
         with tempfile.TemporaryDirectory() as tmp:
             codex = Path(tmp) / '.codex'

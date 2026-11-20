@@ -311,6 +311,16 @@ live by the service and written by the dropdown or `recall config <key> <value>`
 
 ## Notes
 
+- Empty automatic captures are discarded, so shutdown cannot replace the last
+  useful checkpoint with a desktop containing no windows or terminal panes.
+- `bin/recall-codex-session-hook` is a local workaround for shared Codex daemons
+  inheriting the first TUI's Herdr pane environment. It reports a resumed session
+  only when exactly one live TUI's `codex resume <id>` argv matches, using that
+  pane's current ID. Desktop sessions, ambiguous matches, and fresh sessions
+  without an explicit resume ID are ignored; normal snapshot identification
+  still handles those terminal sessions through title/log matching.
+  To use it, have `~/.codex/herdr-agent-state.sh` delegate to this helper.
+  Reinstalling Herdr's Codex integration can overwrite that entry point.
 - State lives in `~/.local/state/omarchy-recall`, mode `0700`: snapshots include
   terminal scrollback, which includes whatever was on your screen.
 - Restore is keyed to monitor topology and warns when it changed since the

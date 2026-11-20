@@ -16,6 +16,14 @@ die()  { printf 'recall: error: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'recall: %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# A shutdown capture can succeed after every window and terminal has exited.
+# Such a capture must not replace the automatic recovery checkpoint.
+snapshot_has_work() {
+  jq -e '((.windows // []) | length) > 0
+    or ((.terminal.herdr.panes // []) | length) > 0
+    or ((.terminal.tmux.sessions // []) | length) > 0' "$1" >/dev/null 2>&1
+}
+
 # Windows that exist because the desktop exists, not because you opened them.
 # Restoring these fights the shell that already owns them.
 RECALL_IGNORE_CLASSES_DEFAULT='[

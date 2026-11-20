@@ -285,6 +285,12 @@ jq -n \
     }
   }' > "$TMP/snapshot.json"
 
+if [[ "$KIND" == "auto" ]] && ! snapshot_has_work "$TMP/snapshot.json"; then
+  log_section "save $NAME ($KIND)"
+  logmsg "  empty automatic capture ignored; keeping the previous recovery snapshot"
+  exit 0
+fi
+
 chmod -R go-rwx "$TMP"
 rm -rf -- "$DEST"
 mv "$TMP" "$DEST"

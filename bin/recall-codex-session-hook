@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Route resumed Codex sessions by live TUI argv, never daemon-inherited pane IDs.
+
+Fresh sessions without a verifiable resume argv are deliberately not reported;
+Session Recall can identify those later from its existing title/log matching.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import socket
+import sys
+import time
+
+
+def resume_id(argv):
+    if not argv or Path(argv[0]).name != "codex" or "resume" not in argv:
+        return None
+    index = argv.index("resume") + 1
+    if index < len(argv) and not argv[index].startswith("-"):
+        return argv[index]
+    return None
+
+
+def matching_panes(panes, processes, session_id):
+    return [p["pane_id"] for p in panes
+            if any(resume_id(proc.get("argv", [])) == session_id
+                    for proc in processes.get(p["pane_id"], []))]
+
+
+def api(*args):
+    result = subprocess.run(["herdr", *args], capture_output=True, text=True,
+                            timeout=2, check=True)
+    return json.loads(result.stdout)["result"]
+
+
+def main():
+    event = json.load(sys.stdin)
+    sid = event.get("session_id")
+    if (os.environ.get("HERDR_ENV") != "1" or not sid
+            or event.get("hook_event_name") != "SessionStart"
+            or not event.get("transcript_path")):
+        return
+    panes = api("api", "snapshot")["snapshot"]["panes"]
+    processes = {}
+    for pane in panes:
+        if pane.get("agent") in (None, "codex"):
+            info = api("pane", "process-info", "--pane", pane["pane_id"])
+            processes[pane["pane_id"]] = info["process_info"]["foreground_processes"]
+    matches = matching_panes(panes, processes, sid)
+    # Multiple TUIs attached to the same session are ambiguous; do not guess.
+    if len(matches) != 1:
+        return
+    request = {"id": "recall:codex:" + str(time.time_ns()),
+               "method": "pane.report_agent_session",
+               "params": {"pane_id": matches[0], "source": "herdr:codex",
+                          "agent": "codex", "seq": time.time_ns(),
+                          "agent_session_id": sid, "session_start_source": "resume"}}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(2)
+        client.connect(os.environ["HERDR_SOCKET_PATH"])
+        client.sendall((json.dumps(request) + "\n").encode())
+        response = json.loads(client.makefile().readline())
+        if "error" in response:
+            print("Herdr session report: " + json.dumps(response["error"]), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        # Recovery metadata must never stop Codex startup.
+        pass
